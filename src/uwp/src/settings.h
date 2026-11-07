@@ -22,6 +22,8 @@ constexpr uint32_t OVERLAY_DETAILED   = 3;
 // The user's settings, in LocalState\kyty-uwp.json (the settings page and `uwp.ps1 folders` edit
 // it). They apply when a game starts.
 struct AppSettings {
+	std::string guest_platform =
+	    "auto"; // Diagnostic override; executable validation remains mandatory.
 	// Searched for games besides LocalState\Games, which needs no setup.
 	std::vector<std::filesystem::path> game_folders;
 	// The settings page, User Data Path: where saves (_SaveData), patches (_Patches) and trophies (_Trophies) are kept, for one on a USB

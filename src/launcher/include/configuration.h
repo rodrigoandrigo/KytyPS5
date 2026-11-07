@@ -89,6 +89,9 @@ public:
 
 	Configuration() = default;
 
+	Common::GuestPlatform platform = Common::GuestPlatform::Unknown;
+	QString               platform_error;
+	QString               guest_platform = QStringLiteral("auto");
 	QString     name;
 	QString     title_id;    /* Serial / title id from sce_sys/param.json */
 	QString     gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
@@ -150,6 +153,7 @@ public:
 	QString elf = QStringLiteral("eboot.bin");
 
 	void CopyEmulatorSettingsFrom(const Configuration& other) {
+		guest_platform              = other.guest_platform;
 		screen_resolution           = other.screen_resolution;
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
@@ -194,6 +198,8 @@ public:
 	}
 
 	void CopyGameInfoFrom(const Configuration& other) {
+		platform        = other.platform;
+		platform_error  = other.platform_error;
 		name            = other.name;
 		title_id        = other.title_id;
 		gameVersion     = other.gameVersion;

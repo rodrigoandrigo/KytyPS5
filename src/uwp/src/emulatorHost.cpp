@@ -119,6 +119,12 @@ void EmulatorHost::Start(winrt::Windows::UI::Xaml::Controls::SwapChainPanel cons
 		options.app0_dir   = IsArchivePath(game_dir) ? Common::MakeArchivePath(game_dir) : game_dir;
 		options.elf        = "/app0/eboot.bin";
 		options.game_patch = game_patch;
+		const auto platform = Common::ParseGuestPlatform(settings.guest_platform);
+		if (!platform) {
+			Log("invalid guest_platform setting\n");
+			return;
+		}
+		options.requested_platform = *platform;
 		auto& config         = options.config;
 		config.screen_width  = settings.screen_width;
 		config.screen_height = settings.screen_height;

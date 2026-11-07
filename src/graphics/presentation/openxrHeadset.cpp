@@ -601,7 +601,7 @@ void OpenXrInit() {
 	uint32_t                count = 0;
 	xrEnumerateViewConfigurationViews(g.instance, g.system,
 	                                  XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &count, views);
-	g.eye = {views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight};
+	g.eye = vk::Extent2D {views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight};
 	XrSystemProperties properties {XR_TYPE_SYSTEM_PROPERTIES};
 	xrGetSystemProperties(g.instance, g.system, &properties);
 	Log::WriteToConsoleAndLog(fmt::format("OpenXR: headset '{}' ready\n", properties.systemName));

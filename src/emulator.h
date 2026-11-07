@@ -3,6 +3,7 @@
 
 #include "common/additionalContent.h"
 #include "common/emulatorConfig.h"
+#include "common/guestPlatform.h"
 #include "common/stringUtils.h"
 
 #include <filesystem>
@@ -10,7 +11,9 @@
 namespace Emulator {
 
 struct RunOptions {
+	bool                                 ps4_runtime = false;
 	Config::ConfigOptions                config;
+	Common::GuestPlatform                requested_platform = Common::GuestPlatform::Unknown;
 	std::filesystem::path                app0_dir;
 	std::filesystem::path                elf;
 	std::filesystem::path                game_patch;
@@ -18,7 +21,7 @@ struct RunOptions {
 	std::vector<Common::AddContentEntry> addcont;
 };
 
-void Run(const RunOptions& options);
+int Run(const RunOptions& options);
 int LoadExec(const char* path, const char* const argv[]);
 
 } // namespace Emulator

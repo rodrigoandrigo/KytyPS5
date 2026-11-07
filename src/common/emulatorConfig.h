@@ -2,9 +2,10 @@
 #define KYTY_COMMON_EMULATOR_CONFIG_H_
 
 #include "common/common.h"
+#include "common/guestPlatform.h"
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -49,6 +50,7 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 constexpr uint32_t kGuestRamBudgetAuto = 0xFFFFFFFFu;
 
 struct ConfigOptions {
+	Common::GuestPlatform          guest_platform              = Common::GuestPlatform::PS5;
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
 	std::string            user_name                   = "Kyty";
@@ -206,6 +208,7 @@ bool     IsNetworkConnected();
 bool     PsnEmulationEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
+Common::GuestPlatform GetGuestPlatform();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();

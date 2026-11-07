@@ -927,6 +927,21 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+bool IsGuestRangeAccessible(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	if (!g_virtual_ranges || !address || size > UINT64_MAX - address) return false;
+	const auto end = address + size;
+	while (address < end) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(address, 0, &range) || range.start > address ||
+		    range.size > UINT64_MAX - range.start || range.start + range.size <= address ||
+		    (range.protection & static_cast<uint32_t>(mode)) != static_cast<uint32_t>(mode))
+			return false;
+		address = std::min(end, range.start + range.size);
+	}
+	return true;
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
@@ -971,7 +986,7 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	EnsureGuestCommitted(vaddr, size); // Xbox fork (T3): a host call is about to write into this range
-	if (size == 0) {
+	if (size == 0 || g_gpu_resources == nullptr) {
 		return;
 	}
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
@@ -3420,8 +3435,8 @@ static std::string GuestPrivateMemorySummary() {
 }
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
-                               const char* name) {
-	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+                               const char* name, bool fixed) {
+	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, fixed);
 }
 
 void ChargeFlexibleMemory(uint64_t size) {

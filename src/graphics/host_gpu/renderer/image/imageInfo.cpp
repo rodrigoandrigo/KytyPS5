@@ -352,7 +352,7 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 		copy.bufferRowLength   = mip.linear_pitch * tiling.texel_width;
 		copy.bufferImageHeight = image_heights[level];
 		copy.imageSubresource  = {aspect, level, 0, 1};
-		copy.imageExtent       = {active.width, active.height, 1};
+		copy.imageExtent       = vk::Extent3D {active.width, active.height, 1};
 		if (image_heights[level] == 0) {
 			copy.bufferImageHeight = IsTiled() ? Common::AlignUp(active.height, tiling.texel_height)
 			                                   : mip.height * tiling.texel_height;

@@ -1218,7 +1218,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			const bool depth = image.info.IsDepth();
 			if (depth) {
 				const auto value = clear.color.float32[0];
-				clear.depthStencil = {value, 0u};
+				clear.depthStencil = vk::ClearDepthStencilValue {value, 0u};
 			}
 			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
 			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,

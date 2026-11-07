@@ -556,7 +556,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.pixel_format    = pixel_format.format;
 	info.guest_format    = pixel_format.guest_format;
 	info.type            = Graphics::Prospero::ImageType::kColor2D;
-	info.extent          = {attribute.width, attribute.height, 1};
+	info.extent          = vk::Extent3D {attribute.width, attribute.height, 1};
 	info.resources       = {1, 1};
 	info.bytes_per_block = pixel_format.bytes_per_element;
 	info.samples         = 1;

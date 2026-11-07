@@ -337,7 +337,8 @@ void Select(const std::shared_ptr<Launcher>& launcher, size_t index) {
 	launcher->selected = index;
 	launcher->settings_button.XYFocusDown(launcher->covers.Children().GetAt(static_cast<uint32_t>(index)));
 	const auto& game   = launcher->games[index];
-	launcher->title.Text(winrt::to_hstring(game.name));
+	launcher->title.Text(winrt::to_hstring(game.name) + L" · " +
+	                     winrt::to_hstring(Common::GuestPlatformName(game.platform)));
 	ShowBackdrop(launcher, ++launcher->selection, BackdropImage(game.folder));
 	if (launcher->home_screen_music) {
 		TitleMusic::Play(game);
@@ -361,7 +362,8 @@ xaml::Controls::Button CreateCover(const std::shared_ptr<Launcher>& launcher, si
 	const auto& game = launcher->games[index];
 
 	xaml::Controls::TextBlock name;
-	name.Text(winrt::to_hstring(game.name));
+	name.Text(winrt::to_hstring(game.name) + L" · " +
+	          winrt::to_hstring(Common::GuestPlatformName(game.platform)));
 	name.TextWrapping(xaml::TextWrapping::WrapWholeWords);
 	name.TextAlignment(xaml::TextAlignment::Center);
 	name.VerticalAlignment(xaml::VerticalAlignment::Center);

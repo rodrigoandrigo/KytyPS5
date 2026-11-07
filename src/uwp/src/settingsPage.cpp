@@ -819,6 +819,17 @@ xaml::UIElement CreateSettingsPage(std::function<void(bool folders_changed)> bac
 	const auto testing   = panel(L"TestingGroup");
 	AddHeading(developer, L"Diagnostics");
 	AddHeading(testing, L"Testing");
+	AddChoice(testing, explanation, L"Game platform", {L"Automatic", L"PS4", L"PS5"},
+	          settings.guest_platform == "ps4"   ? 1
+	          : settings.guest_platform == "ps5" ? 2
+	                                             : 0,
+	          [state, save](size_t index) {
+		          state->settings.guest_platform = index == 1 ? "ps4" : index == 2 ? "ps5" : "auto";
+		          save();
+	          },
+	          {L"Automatic reads the game's platform from its files.",
+	           L"PS4 games can be identified, but cannot run yet. Manual selection keeps file "
+	           L"validation enabled."});
 	AddSwitch(
 	    developer, explanation, L"Graphics debug layer", settings.debug_layer,
 	    [state, save](bool on) {

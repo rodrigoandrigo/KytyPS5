@@ -94,6 +94,14 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return (size < 0 ? 0 : static_cast<uint64_t>(size));
 }
 
+bool SysFileIsSymbolicLink(const std::filesystem::path& name, bool* link) {
+	const auto  path = get_internal_name(name);
+	struct stat info {};
+	if (lstat(path.c_str(), &info) != 0) return false;
+	*link = S_ISLNK(info.st_mode);
+	return true;
+}
+
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
 	const auto  path = get_internal_name(name);
 	struct stat info {};

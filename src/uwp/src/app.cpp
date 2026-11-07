@@ -774,6 +774,23 @@ xaml::UIElement CreateGamePage(std::filesystem::path game) {
 		return CreateProblemPage(game.wstring().c_str(), *problem,
 		                         [game] { return CreateGamePage(game); });
 	}
+	const auto entry            = ReadGame(game);
+	const auto platform_setting = LoadSettings().guest_platform;
+	const auto requested        = Common::ParseGuestPlatform(platform_setting);
+	const auto profile =
+	    requested
+	        ? Common::ResolveGuestProfile({entry.platform, entry.platform_error}, *requested)
+	        : Common::GuestDetection {Common::GuestPlatform::Unknown,
+	                                  "Invalid guest_platform setting; expected auto, ps4 or ps5."};
+	const auto error = Common::GuestLaunchError(profile);
+	Log("guest platform: detected=%s requested=%s selected=%s\n",
+	    Common::GuestPlatformName(entry.platform), platform_setting.c_str(),
+	    Common::GuestPlatformName(profile.platform));
+	if (!error.empty()) {
+		return CreateProblemPage(winrt::to_hstring(entry.name),
+		                         {L"The game cannot start", winrt::to_hstring(error)},
+		                         [game] { return CreateGamePage(game); });
+	}
 	return CreateEmulatorPage(std::move(game));
 }
 

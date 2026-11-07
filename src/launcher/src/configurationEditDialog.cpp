@@ -3,7 +3,6 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -34,6 +33,9 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <SDL3/SDL.h>
+#include <algorithm>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -303,6 +305,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
+	m_ui->comboBox_guest_platform->clear();
+	m_ui->comboBox_guest_platform->addItem(tr("Automatic"), QStringLiteral("auto"));
+	m_ui->comboBox_guest_platform->addItem(QStringLiteral("PS4"), QStringLiteral("ps4"));
+	m_ui->comboBox_guest_platform->addItem(QStringLiteral("PS5"), QStringLiteral("ps5"));
+	m_ui->comboBox_guest_platform->setCurrentIndex(
+	    std::max(0, m_ui->comboBox_guest_platform->findData(info.guest_platform)));
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(
@@ -540,6 +548,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
+	info.guest_platform            = ui.comboBox_guest_platform->currentData().toString();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();

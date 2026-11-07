@@ -5,12 +5,17 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "loader/ps4Module.h"
 #include "loader/symbolDatabase.h"
 
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
+namespace Libs::Ps4 {
+struct RuntimeStats;
+}
 
 namespace Loader {
 
@@ -123,6 +128,8 @@ struct Program {
 	RuntimeLinker*               rt        = nullptr;
 	uint32_t                     load_count = 0; // Successful sceKernelLoadStartModule calls.
 	std::filesystem::path        file_name;
+	std::unique_ptr<Ps4Module>      ps4_module;
+	bool                            ps4_executed = false;
 	std::unique_ptr<Elf64>       elf;
 	std::unique_ptr<DynamicInfo> dynamic_info;
 	uint64_t                     base_vaddr        = 0;
@@ -150,7 +157,14 @@ public:
 
 	void DbgDump(const std::string& folder);
 
+	Program*                 LoadPs4Program(const std::filesystem::path& path, std::string& error);
+	bool                     ExecutePs4(Program* program, const std::filesystem::path& app0,
+	                                    const std::filesystem::path& data, std::string& error,
+	                                    Libs::Ps4::RuntimeStats* stats = nullptr);
 	Program* LoadProgram(const std::filesystem::path& elf_name);
+	std::optional<Ps4Module> PreparePs4Program(const std::filesystem::path& path, uint64_t base,
+	                                           std::string& error, uint64_t tls_module_id = 1);
+	SymbolDatabase*          Ps4Symbols() { return m_ps4_symbols.get(); }
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
 	void     UnloadProgram(Program* program);
@@ -198,6 +212,7 @@ private:
 
 	std::vector<Program*>           m_programs;
 	std::unique_ptr<SymbolDatabase> m_symbols;
+	std::unique_ptr<SymbolDatabase> m_ps4_symbols = std::make_unique<SymbolDatabase>();
 	Common::Mutex                   m_mutex;
 
 	application_heap_malloc_func_t         m_application_heap_malloc         = nullptr;

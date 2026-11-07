@@ -3,6 +3,7 @@
 #include "additionalContentDialog.h"
 #include "cheatFile.h"
 #include "common/archive.h"
+#include "common/guestPlatform.h"
 #include "compatibilityDatabase.h"
 #include "configuration.h"
 #include "configurationEditDialog.h"
@@ -698,7 +699,17 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
 
 		SetGameFiles(*info, base, game_path, metadata, archive);
-		const auto* compatibility = m_compatibility->Find(info->title_id);
+        const auto inspected =
+            Common::InspectGuestGame(archive ? Common::MakeArchivePath(GameContent::ToPath(base))
+		                                        : GameContent::ToPath(base));
+        info->platform       = inspected.detection.platform;
+        info->platform_error = QString::fromStdString(inspected.detection.error);
+        if (info->platform == Common::GuestPlatform::PS4) {
+            if (!inspected.title.empty()) info->name = QString::fromStdString(inspected.title);
+            info->title_id    = QString::fromStdString(inspected.title_id);
+            info->gameVersion = QString::fromStdString(inspected.version);
+        }
+        const auto* compatibility = m_compatibility->Find(info->title_id);
 		if (compatibility != nullptr) {
 			info->game_status  = compatibility->status;
 			info->game_comment = compatibility->comment;

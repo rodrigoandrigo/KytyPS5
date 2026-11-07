@@ -13,9 +13,10 @@
 #include "common/platform/sysWindowsVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <atomic>
+
 #if defined(KYTY_PLATFORM_UWP)
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <map>

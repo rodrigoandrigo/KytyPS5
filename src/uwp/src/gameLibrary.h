@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_UWP_GAMELIBRARY_H_
 #define EMULATOR_SRC_UWP_GAMELIBRARY_H_
 
+#include "common/guestPlatform.h"
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -9,17 +11,19 @@
 namespace Kyty::Uwp {
 
 struct GameEntry {
-	std::string           title_id; // e.g. PPSA00000; empty when param.json has none
+	Common::GuestPlatform platform = Common::GuestPlatform::Unknown;
+	std::string           platform_error;
+	std::string           title_id; // e.g. PPSA00000; empty when metadata has none
 	std::string           name;
 	std::string           version;
 	std::filesystem::path folder; // the game's folder, or its .zar archive
 };
 
-// The game in `folder` (a folder with an eboot.bin, or a .zar archive), described by its sce_sys\param.json.
+// The game in `folder` (a folder with an eboot.bin, or a .zar archive), described by its sce_sys\param.json or param.sfo.
 [[nodiscard]] GameEntry ReadGame(const std::filesystem::path& folder);
 
 // Finds the games in the game folders (GameFolders): folders with an eboot.bin, the game folder
-// itself or up to two levels below it, and .zar archives in those folders, described by sce_sys\param.json. Saves the result to
+// itself or up to two levels below it, and .zar archives in those folders, described by sce_sys\param.json or param.sfo. Saves the result to
 // LocalState\library.json.
 std::vector<GameEntry> ScanGames();
 

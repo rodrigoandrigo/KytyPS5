@@ -22,10 +22,12 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/ps4Kernel.h"
 #include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
@@ -139,7 +141,33 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
-void Run(const RunOptions& options) {
+static int RunPs4Cpu(const RunOptions& options, const std::filesystem::path& relative) {
+	Common::Subsystems subsystems(true);
+	subsystems.Initialize<Config::Lifecycle>();
+	auto config           = options.config;
+	config.guest_platform = Common::GuestPlatform::PS4;
+	Config::Load(config);
+	subsystems.Initialize<Log::Lifecycle>();
+	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
+	subsystems.Initialize<Libs::Network::Lifecycle>();
+	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
+	auto*       rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	std::string error;
+	auto*       program = rt->LoadPs4Program(options.app0_dir / relative, error);
+	bool        ok      = false;
+	if (program) {
+		// This diagnostic profile deliberately uses its own writable directory.
+		const auto data = std::filesystem::current_path() / "_Ps4Data" / "diagnostic";
+		ok              = rt->ExecutePs4(program, options.app0_dir, data, error);
+		rt->UnloadProgram(program);
+	}
+	rt->Clear();
+	if (!ok) std::fprintf(stderr, "PS4 CPU runtime rejected: %s\n", error.c_str());
+	return ok ? 0 : 1;
+}
+
+int Run(const RunOptions& options) {
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");
 	}
@@ -148,11 +176,40 @@ void Run(const RunOptions& options) {
 		EXIT("ELF is required\n");
 	}
 
+	const auto relative = options.elf.lexically_normal().lexically_relative("/app0");
+	if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
+		std::fprintf(stderr, "Game rejected: executable must be inside /app0.\n");
+		return 1;
+	}
+	const auto inspected = Common::InspectGuestGame(options.app0_dir, relative);
+	const auto profile =
+	    Common::ResolveGuestProfile(inspected.detection, options.requested_platform);
+	std::fprintf(stderr, "Guest platform: detected=%s requested=%s selected=%s\n",
+	             Common::GuestPlatformName(inspected.detection.platform),
+	             options.requested_platform == Common::GuestPlatform::Unknown
+	                 ? "auto"
+	                 : Common::GuestPlatformName(options.requested_platform),
+	             Common::GuestPlatformName(profile.platform));
+	if (options.ps4_runtime && profile.error.empty()) {
+		if (profile.platform != Common::GuestPlatform::PS4) {
+			std::fprintf(stderr, "PS4 CPU runtime requires a PS4 guest profile.\n");
+			return 1;
+		}
+		return RunPs4Cpu(options, relative);
+	}
+	if (const auto error = Common::GuestLaunchError(profile); !error.empty()) {
+		std::fprintf(stderr, "Game rejected: %s\n", error.c_str());
+		return 1;
+	}
+	auto config                   = options.config;
+	config.guest_platform         = profile.platform;
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
-	Init(options.config, param_json, subsystems);
+	Init(config, param_json, subsystems);
 
 	PrintSystemInfo();
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Guest platform: {}\n", Common::GuestPlatformName(config.guest_platform)));
 	std::string title_id;
 	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
 	if (title_id.empty()) {
@@ -185,6 +242,7 @@ void Run(const RunOptions& options) {
 	LoadElf(options.elf);
 
 	Execute(options.game_patch);
+	return 0;
 }
 
 } // namespace Emulator

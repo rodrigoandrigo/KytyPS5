@@ -1,17 +1,17 @@
 #include "gameLibrary.h"
 
+#include <windows.h>
+
+#include "common/archive.h"
 #include "fileAccess.h"
 #include "gameSource.h"
 #include "log.h"
 #include "settings.h"
 
-#include <windows.h>
-
-#include <winrt/base.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <nlohmann/json.hpp>
+#include <winrt/base.h>
 
 namespace Kyty::Uwp {
 
@@ -20,31 +20,6 @@ namespace {
 std::string JsonString(const nlohmann::json& object, const char* key) {
 	const auto it = object.find(key);
 	return it != object.end() && it->is_string() ? it->get<std::string>() : std::string();
-}
-
-// The title in the default language, else in English, else in any language (as the desktop
-// launcher shows it).
-std::string TitleName(const nlohmann::json& param) {
-	const auto localized = param.find("localizedParameters");
-	if (localized == param.end() || !localized->is_object()) {
-		return {};
-	}
-	for (const auto& language: {JsonString(*localized, "defaultLanguage"), std::string("en-US")}) {
-		const auto entry = localized->find(language);
-		if (!language.empty() && entry != localized->end() && entry->is_object()) {
-			if (auto name = JsonString(*entry, "titleName"); !name.empty()) {
-				return name;
-			}
-		}
-	}
-	for (const auto& entry: *localized) {
-		if (entry.is_object()) {
-			if (auto name = JsonString(entry, "titleName"); !name.empty()) {
-				return name;
-			}
-		}
-	}
-	return {};
 }
 
 void ScanFolder(const std::filesystem::path& folder, int depth, std::vector<GameEntry>& games) {
@@ -78,6 +53,8 @@ void SaveLibrary(const std::vector<GameEntry>& games) {
 		list.push_back({{"title_id", game.title_id},
 		                {"name", game.name},
 		                {"version", game.version},
+		                {"platform", Common::GuestPlatformName(game.platform)},
+		                {"platform_error", game.platform_error},
 		                {"folder", winrt::to_string(game.folder.wstring())}});
 	}
 	const auto text = nlohmann::json {{"games", list}}.dump(2);
@@ -93,19 +70,14 @@ GameEntry ReadGame(const std::filesystem::path& folder) {
 	GameEntry game;
 	game.folder = folder;
 	game.name   = winrt::to_string((IsArchivePath(folder) ? folder.stem() : folder.filename()).wstring());
-	if (const auto text = ReadGameText(folder / L"sce_sys" / L"param.json")) {
-		const auto param = nlohmann::json::parse(*text, nullptr, false);
-		if (!param.is_discarded() && param.is_object()) {
-			game.title_id = JsonString(param, "titleId");
-			game.version  = JsonString(param, "appVersion");
-			if (game.version.empty()) {
-				game.version = JsonString(param, "contentVersion");
-			}
-			if (auto name = TitleName(param); !name.empty()) {
-				game.name = std::move(name);
-			}
-		}
-	}
+	const auto root     = IsArchivePath(folder) ? Common::MakeArchivePath(folder) : folder;
+	const auto info     = Common::InspectGuestGame(root);
+	game.platform       = info.detection.platform;
+	game.platform_error = info.detection.error;
+	game.title_id       = info.title_id;
+	game.version        = info.version;
+	if (!info.title.empty()) game.name = info.title;
+
 	return game;
 }
 
@@ -141,6 +113,18 @@ std::vector<GameEntry> LoadGameLibrary() {
 		game.name     = JsonString(entry, "name");
 		game.version  = JsonString(entry, "version");
 		game.folder   = std::filesystem::path(winrt::to_hstring(JsonString(entry, "folder")).c_str());
+		if (!entry.contains("platform")) {
+			const auto refreshed = ReadGame(game.folder);
+			game.platform        = refreshed.platform;
+			game.platform_error  = refreshed.platform_error;
+			if (game.name.empty()) game.name = refreshed.name;
+			if (game.title_id.empty()) game.title_id = refreshed.title_id;
+			if (game.version.empty()) game.version = refreshed.version;
+		} else {
+			game.platform = Common::ParseGuestPlatform(JsonString(entry, "platform"))
+			                    .value_or(Common::GuestPlatform::Unknown);
+			game.platform_error = JsonString(entry, "platform_error");
+		}
 		games.push_back(std::move(game));
 	}
 	return games;

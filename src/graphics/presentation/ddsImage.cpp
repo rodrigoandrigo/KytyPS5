@@ -77,7 +77,7 @@ bool DdsImage::Load(const std::filesystem::path& path) {
 
 	vk::ImageCreateInfo image {};
 	image.imageType   = vk::ImageType::e2D;
-	image.extent      = {width, height, 1};
+	image.extent      = vk::Extent3D {width, height, 1};
 	image.mipLevels   = 1;
 	image.arrayLayers = 1;
 	image.format      = format;

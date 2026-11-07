@@ -211,6 +211,22 @@ option(KYTY_PROFILER "Tracy's profiling zones in the build" ${KYTY_PROFILER_DEFA
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+if(WIN32)
+ # cpuinfo's C sources use the Windows max macro; keep NOMINMAX for the C++ emulator.
+ if(MSVC OR KYTY_CLANG_CL)
+  target_compile_options(cpuinfo PRIVATE "$<$<COMPILE_LANGUAGE:C>:/UNOMINMAX>")
+ else()
+  target_compile_options(cpuinfo PRIVATE "$<$<COMPILE_LANGUAGE:C>:-UNOMINMAX>")
+ endif()
+ # These imports must follow the static FFmpeg archives, including in test executables.
+ get_target_property(kyty_ffmpeg_target FFmpeg::ffmpeg ALIASED_TARGET)
+ if(NOT kyty_ffmpeg_target)
+  set(kyty_ffmpeg_target FFmpeg::ffmpeg)
+ endif()
+ target_link_libraries(${kyty_ffmpeg_target} INTERFACE ws2_32 bcrypt)
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -514,6 +530,45 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
+
+add_kyty_full_emulator_test(ps4_runtime_tests "${KYTY_TESTS_DIR}/Ps4RuntimeTests.cpp")
+if(WIN32)
+	target_link_libraries(ps4_runtime_tests onecore)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME ps4_runtime COMMAND ps4_runtime_tests)
+	add_test(NAME ps4_runtime_profile COMMAND ps4_runtime_tests --run-profile "${CMAKE_CURRENT_BINARY_DIR}/ps4-profile-fixture")
+	set_tests_properties(ps4_runtime ps4_runtime_profile PROPERTIES ENVIRONMENT "KYTY_LAZY_MEMORY=1" TIMEOUT 60)
+endif()
+
+add_executable(ps4_module_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Ps4ModuleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/ps4Module.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+)
+target_link_libraries(ps4_module_tests common)
+if(WIN32)
+	target_link_libraries(ps4_module_tests onecore)
+endif()
+target_include_directories(ps4_module_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME ps4_module COMMAND ps4_module_tests)
+endif()
+
+add_executable(guest_platform_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestPlatformTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/guestPlatform.cpp"
+)
+target_include_directories(guest_platform_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(BUILD_TESTING)
+	add_test(NAME guest_platform COMMAND guest_platform_tests)
+endif()
+
+add_executable(guest_platform_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GuestPlatformFileTests.cpp")
+target_link_libraries(guest_platform_file_tests common ZArchive::zarchive)
+if(BUILD_TESTING)
+	add_test(NAME guest_platform_files COMMAND guest_platform_file_tests)
+endif()
 
 add_executable(archive_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
@@ -905,6 +960,10 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
+		ps4_runtime_tests
+		ps4_module_tests
+		guest_platform_tests
+		guest_platform_file_tests
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests

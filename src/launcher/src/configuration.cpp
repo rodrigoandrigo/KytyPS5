@@ -21,6 +21,7 @@ QString Configuration::NormalizeResolution(const QString& text) {
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
+	KYTY_CFG_SET(guest_platform);
 	KYTY_CFG_SET(screen_resolution);
 	KYTY_CFG_SET(user_name);
 	KYTY_CFG_SET(user_id);
@@ -69,6 +70,7 @@ QVariantMap Configuration::GameSettings() const {
 template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
+	guest_platform        = s.value("guest_platform", QStringLiteral("auto")).toString();
 	const auto resolution = NormalizeResolution(s.value("screen_resolution").toString());
 	screen_resolution     = resolution.isEmpty() ? QStringLiteral("1280x720") : resolution;
 	user_name          = s.value("user_name", user_name).toString();
@@ -173,6 +175,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (user_name.trimmed().isEmpty() || user_name.toUtf8().size() > Config::MAX_USER_NAME_LENGTH) {
 		return fail(tr("User name must contain 1-16 UTF-8 bytes."));
+	}
+	if (guest_platform != "auto" && guest_platform != "ps4" && guest_platform != "ps5") {
+		return fail(tr("Game platform must be auto, ps4 or ps5."));
 	}
 	if (gpu_index < -1) {
 		return fail(tr("GPU index must be -1 or greater."));

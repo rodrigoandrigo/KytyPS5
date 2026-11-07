@@ -37,6 +37,22 @@ endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
 
+add_executable(launcher_guest_platform_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGuestPlatformTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+)
+target_link_libraries(launcher_guest_platform_tests Qt6::Widgets common)
+target_include_directories(launcher_guest_platform_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_guest_platform_tests PROPERTIES AUTOMOC ON)
+if(BUILD_TESTING)
+	add_test(NAME launcher_guest_platform COMMAND launcher_guest_platform_tests)
+	if(WIN32)
+		set_tests_properties(launcher_guest_platform PROPERTIES
+			ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
+	endif()
+endif()
+
 add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
 	src/gameContent.cpp

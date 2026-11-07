@@ -159,7 +159,7 @@ struct Ngs2CustomSamplerRackOption {
 };
 
 union Ngs2RackOptionUnion {
-	Ngs2RackOption                common;
+	Ngs2RackOption                common {};
 	Ngs2SamplerRackOption         sampler;
 	Ngs2MasteringRackOption       mastering;
 	Ngs2SubmixerRackOption        submixer;

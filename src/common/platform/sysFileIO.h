@@ -35,6 +35,7 @@ uint64_t    SysFileTell(sys_file_t& f);                    // NOLINT(google-runt
 bool        SysFileTruncate(sys_file_t& f, uint64_t size); // NOLINT(google-runtime-references)
 bool        SysFileUnlink(sys_file_t&                  f,
                           const std::filesystem::path& name); // NOLINT(google-runtime-references)
+bool              SysFileIsSymbolicLink(const std::filesystem::path& name, bool* link);
 bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
 bool        SysFileCreateDirectory(const std::filesystem::path& path);
 bool        SysFileDeleteDirectory(const std::filesystem::path& path, std::error_code* error);

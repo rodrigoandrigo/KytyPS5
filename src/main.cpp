@@ -57,6 +57,9 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --ps4-runtime                       Experimental PS4 CPU/HLE test profile.\n");
+	::printf("  --platform <auto|ps4|ps5>            Guest platform (diagnostic override). "
+	         "Default: auto.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
@@ -221,6 +224,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		std::string arg = std::string(argv[i]);
 		std::string value;
 
+		if (arg == "--ps4-runtime") {
+			options.ps4_runtime = true;
+			continue;
+		}
 		if (arg == "--help" || arg == "-h") {
 			show_help = true;
 			continue;
@@ -274,6 +281,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--platform") {
+			const auto platform = Common::ParseGuestPlatform(value);
+			if (!platform || value == "Unknown") {
+				::printf("invalid platform: expected auto, ps4 or ps5\n");
+				return false;
+			}
+			options.requested_platform = *platform;
 		} else if (arg == "--guest-exec") {
 			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
 			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
@@ -438,9 +452,7 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	Run(options);
-
-	return 0;
+	return Run(options);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

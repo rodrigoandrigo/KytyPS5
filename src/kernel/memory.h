@@ -154,6 +154,7 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 [[nodiscard]] uint64_t MakeRoomForHost(uint64_t size);
 // Xbox fork (T3): commit the lazy windows of a range before a host call writes into it.
 bool EnsureGuestCommitted(uint64_t vaddr, uint64_t size);
+bool IsGuestRangeAccessible(uint64_t address, uint64_t size, Common::VirtualMemory::Mode mode);
 // Xbox fork (debugging the pager): what happened to the guest memory windows that these values point into (printed when the game crashes).
 void DumpPagerContext(const uint64_t* values, size_t count);
 // Xbox fork (the overlay): guest memory in RAM (lazily committed windows), in the pager's file, and written to the file and read back since the start, in
@@ -243,7 +244,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
                                                 size_t                      output_size);
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
-                               Common::VirtualMemory::Mode mode, const char* name);
+                               Common::VirtualMemory::Mode mode, const char* name,
+                               bool fixed = false);
 // Loaded modules' segments use flexible memory without taking its backing.
 void ChargeFlexibleMemory(uint64_t size);
 void ReleaseFlexibleMemory(uint64_t size);

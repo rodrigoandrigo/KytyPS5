@@ -84,7 +84,8 @@ QString GetPathText(const Configuration& info) {
 }
 
 QString GetDisplayText(const Configuration& info) {
-	QStringList lines({info.name});
+	QStringList lines({info.name, QString::fromLatin1(Common::GuestPlatformName(info.platform))});
+	if (!info.platform_error.isEmpty()) lines.append(info.platform_error);
 
 	if (!info.title_id.isEmpty()) {
 		lines.append(QStringLiteral("Serial ID: %1").arg(info.title_id));
@@ -201,7 +202,8 @@ void ConfigurationItem::Update(bool reload_icon) {
 	const auto display_text = GetDisplayText(*m_info);
 	const auto path         = GetPathText(*m_info);
 
-	setText(NameColumn, m_info->name);
+	setText(NameColumn, m_info->name + QStringLiteral(" · ") +
+	                        QString::fromLatin1(Common::GuestPlatformName(m_info->platform)));
 	setData(NameColumn, Qt::UserRole, m_info->pro_supported);
 	setText(SerialColumn, m_info->title_id);
 	setText(GameVersionColumn,

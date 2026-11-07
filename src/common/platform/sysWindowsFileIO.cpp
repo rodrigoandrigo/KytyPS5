@@ -282,6 +282,13 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return s.QuadPart;
 }
 
+bool SysFileIsSymbolicLink(const std::filesystem::path& name, bool* link) {
+	WIN32_FILE_ATTRIBUTE_DATA info {};
+	if (!HostGetFileAttributesEx(name.c_str(), &info)) return false;
+	*link = (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+	return true;
+}
+
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
 	const bool directory_path = !name.empty() && !name.has_filename() && name != name.root_path();
 	WIN32_FILE_ATTRIBUTE_DATA info {};

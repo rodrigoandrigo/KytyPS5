@@ -8,6 +8,7 @@
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
+#include "libs/ps4Kernel.h"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include "common/platform/sysWindowsVirtual.h"
 #endif
@@ -984,9 +985,9 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	EXIT_IF(program == nullptr);
-	EXIT_IF(program->elf == nullptr);
+	EXIT_IF(program->elf == nullptr && !program->ps4_module);
 
-	if (size >= 12) {
+	if (!program->ps4_module && size >= 12) {
 		// Replace guest stack-canary/errno stores through fs:[0x28] with nops.
 		// Windows x64 cannot host guest FS directly, and an unpatched shared-library access faults
 		// at address 0x28.
@@ -1010,7 +1011,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
-	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
+	if ((program->ps4_module || !program->elf->IsShared()) && program->tls.handler_vaddr != 0 &&
 	    size >= Jit::Call9::GetSize()) {
 		// Replace:
 		//   66 66 66
@@ -1067,6 +1068,7 @@ uint64_t RuntimeLinker::GetEntry() {
 	Common::LockGuard lock(m_mutex);
 
 	for (const auto* p: m_programs) {
+		if (p->ps4_module) return p->ps4_module->entry;
 		if (p->elf != nullptr && !p->elf->IsShared()) {
 			return p->elf->GetEntry() + p->base_vaddr;
 		}
@@ -1098,6 +1100,7 @@ void RuntimeLinker::DbgDump(const std::string& folder) {
 		auto folder_str = Common::FixDirectorySlash(folder);
 		folder_str += Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name));
 
+		if (p->ps4_module) continue;
 		EXIT_IF(p->elf == nullptr);
 
 		p->elf->DbgDump(folder_str);
@@ -1143,7 +1146,7 @@ void RuntimeLinker::RelocateAll() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_programs) {
-		Relocate(p);
+		if (!p->ps4_module) Relocate(p);
 	}
 }
 
@@ -1218,6 +1221,192 @@ RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 
 RuntimeLinker::~RuntimeLinker() {
 	Clear();
+}
+
+Program* RuntimeLinker::LoadPs4Program(const std::filesystem::path& path, std::string& error) {
+	Common::LockGuard lock(m_mutex);
+	if (!m_programs.empty() || g_tls_main_program || !m_ps4_symbols) {
+		error = "PS4 runtime requires an empty linker and an initialized PS4 registry.";
+		return nullptr;
+	}
+	Libs::Ps4::RegisterKernelExports(*m_ps4_symbols);
+	auto module = PreparePs4Program(path, 0x400000, error);
+	if (!module || module->shared || !module->entry) {
+		if (module) error = "PS4 runtime requires a main executable, not a shared module.";
+		return nullptr;
+	}
+	if (module->tls_alignment > 32) {
+		error = "PS4 CPU profile supports TLS alignment up to 32 bytes.";
+		return nullptr;
+	}
+	uint64_t previous_end = 0;
+	for (const auto& segment: module->segments) {
+		if ((segment.flags & ~(PF_R | PF_W | PF_X)) || (segment.offset & 0x3fff) ||
+		    ((segment.flags & (PF_W | PF_X)) == (PF_W | PF_X)) || segment.offset < previous_end) {
+			error = "PS4 runtime requires separate, 16 KiB-aligned code/data segments without RWX.";
+			return nullptr;
+		}
+		previous_end = AlignUp(segment.offset + segment.size, 0x4000);
+	}
+	auto  owner          = std::make_unique<Program>();
+	auto* p              = owner.get();
+	p->rt                = this;
+	p->file_name         = path;
+	p->unique_id         = 1;
+	p->base_size         = module->image.size();
+	p->base_size_aligned = AlignUp(p->base_size, 0x4000);
+	p->mapped_size       = p->base_size_aligned + Jit::SafeCall::GetSize();
+	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
+		error = "Cannot install PS4 guest fault handling.";
+		return nullptr;
+	}
+	p->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    module->base, p->mapped_size, Common::VirtualMemory::Mode::ReadWrite, "PS4 main", true);
+	if (p->base_vaddr != module->base) {
+		error = "PS4 main address range is unavailable.";
+		return nullptr;
+	}
+	// Program allocations are private, committed RW memory, not physical backing mappings.
+	std::memcpy(reinterpret_cast<void*>(p->base_vaddr), module->image.data(), module->image.size());
+	p->tls.init_image    = module->tls_template;
+	p->tls.init_size     = module->tls_template.size();
+	p->tls.image_size    = module->tls_template.size();
+	p->tls.tcb_offset    = module->tls_static_size;
+	p->tls.handler_vaddr = p->base_vaddr + p->base_size_aligned;
+	p->dynamic_info      = std::make_unique<DynamicInfo>();
+	p->ps4_module        = std::make_unique<Ps4Module>(std::move(*module));
+	SetupTlsHandler(p);
+	for (const auto& segment: p->ps4_module->segments)
+		if (segment.flags & PF_X) PatchProgram(p, p->base_vaddr + segment.offset, segment.size);
+	using Mode = Common::VirtualMemory::Mode;
+	if (!Libs::LibKernel::Memory::ProtectGuestMemory(p->base_vaddr, p->base_size_aligned,
+	                                                 Mode::NoAccess)) {
+		error = "Cannot guard PS4 image gaps.";
+		DeleteProgram(owner.release());
+		return nullptr;
+	}
+	for (const auto& segment: p->ps4_module->segments) {
+		const auto mode = GetMode(segment.flags);
+		if (!Libs::LibKernel::Memory::ProtectGuestMemory(p->base_vaddr + segment.offset,
+		                                                 AlignUp(segment.size, 0x4000), mode)) {
+			error = "Cannot publish PS4 segment permissions.";
+			DeleteProgram(owner.release());
+			return nullptr;
+		}
+		if (segment.flags & PF_X)
+			Common::VirtualMemory::FlushInstructionCache(p->base_vaddr + segment.offset,
+			                                             segment.size);
+	}
+	std::vector<uint8_t>().swap(p->ps4_module->image);
+	m_programs.push_back(owner.release());
+	LOGF("PS4 runtime loaded: entry=0x%016" PRIx64 " mappings=%zu TLS=%" PRIu64 "\n",
+	     p->ps4_module->entry, p->ps4_module->segments.size(), p->tls.image_size);
+	return p;
+}
+
+bool RuntimeLinker::ExecutePs4(Program* p, const std::filesystem::path& app0,
+                               const std::filesystem::path& data, std::string& error,
+                               Libs::Ps4::RuntimeStats* stats) {
+	{
+		Common::LockGuard lock(m_mutex);
+		if (!p || !p->ps4_module || p->ps4_executed ||
+		    std::ranges::find(m_programs, p) == m_programs.end()) {
+			error = "PS4 program is not loaded or has already executed.";
+			return false;
+		}
+	}
+	if (!Libs::LibKernel::PthreadSelfOrNull()) Libs::LibKernel::PthreadInitSelfForMainThread();
+	auto* top     = Libs::LibKernel::PthreadCreateMainGuestStack();
+	auto  session = Libs::Ps4::KernelSession::Create(p, app0, data, error);
+	if (!session) return false;
+	const auto& configured = Config::GetGuestArguments();
+	const auto  arguments =
+        configured.empty()
+	         ? std::vector<std::string> {Common::PathToString(p->file_name.filename())}
+	         : configured;
+	size_t total = 0;
+	for (const auto& argument: arguments) {
+		if (total >= 65536 || argument.size() >= 65536 - total) {
+			error = "PS4 argument block is too large.";
+			return false;
+		}
+		total += argument.size() + 1;
+	}
+	if (arguments.size() > 64 || total > 65536) {
+		error = "PS4 argument block is too large.";
+		return false;
+	}
+	uintptr_t                cursor = reinterpret_cast<uintptr_t>(top) - 0x100;
+	std::vector<const char*> argv;
+	for (const auto& argument: arguments) {
+		cursor -= argument.size() + 1;
+		std::memcpy(reinterpret_cast<void*>(cursor), argument.c_str(), argument.size() + 1);
+		argv.push_back(reinterpret_cast<const char*>(cursor));
+	}
+	cursor = (cursor - (offsetof(EntryParams, argv) + (argv.size() + 1) * sizeof(char*))) &
+	         ~uintptr_t(15);
+	auto* params = reinterpret_cast<EntryParams*>(cursor);
+	std::memset(params, 0, offsetof(EntryParams, argv) + (argv.size() + 1) * sizeof(char*));
+	params->argc = static_cast<int>(argv.size());
+	for (size_t i = 0; i < argv.size(); ++i)
+		params->argv[i] = argv[i];
+	p->ps4_executed = true;
+	for (auto address: p->ps4_module->initializers) {
+		if (CallModuleFunction(reinterpret_cast<module_ini_fini_func_t>(address), 0, nullptr,
+		                       nullptr) != 0) {
+			error = "PS4 module initializer failed.";
+			return false;
+		}
+	}
+	LOGF("PS4 runtime entry: 0x%016" PRIx64 " argc=%d guest_stack=0x%016" PRIx64 "\n",
+	     p->ps4_module->entry, params->argc, static_cast<uint64_t>(cursor));
+	RunEntry(p->ps4_module->entry, params, ProgramExitHandler,
+	         reinterpret_cast<void*>(cursor - 0x1000));
+	if (!session->JoinAll(error)) return false;
+	for (auto address: p->ps4_module->finalizers) {
+		if (CallModuleFunction(reinterpret_cast<module_ini_fini_func_t>(address), 0, nullptr,
+		                       nullptr) != 0) {
+			error = "PS4 module finalizer failed.";
+			return false;
+		}
+	}
+	if (!session->JoinAll(error)) return false;
+	if (!session->Finish(error)) return false;
+	if (stats) *stats = session->Stats();
+	LOGF("PS4 runtime returned cleanly\n");
+	return true;
+}
+
+std::optional<Ps4Module> RuntimeLinker::PreparePs4Program(const std::filesystem::path& path,
+                                                          uint64_t base, std::string& error,
+                                                          uint64_t tls_module_id) {
+	Common::LockGuard lock(m_mutex);
+	if (!m_ps4_symbols) {
+		error = "PS4 symbol registry has been cleared.";
+		return std::nullopt;
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid() || file.Size() > 64u * 1024u * 1024u) {
+		error = "PS4 module cannot be read or exceeds the 64 MiB loader limit.";
+		return std::nullopt;
+	}
+	std::vector<uint8_t> bytes(static_cast<size_t>(file.Size()));
+	uint32_t             count = 0;
+	file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &count);
+	if (count != bytes.size()) {
+		error = "PS4 module read is incomplete.";
+		return std::nullopt;
+	}
+	auto module = PreparePs4Module(bytes, base, *m_ps4_symbols, error, tls_module_id);
+	if (module) {
+		LOGF("PS4 loader: base=0x%016" PRIx64 " entry=0x%016" PRIx64
+		     " segments=%zu imports=%zu tls=%zu\n",
+		     module->base, module->entry, module->segments.size(), module->resolved_imports.size(),
+		     module->tls_template.size());
+	} else {
+		LOGF("PS4 loader rejected: %s\n", error.c_str());
+	}
+	return module;
 }
 
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
@@ -1372,6 +1561,7 @@ void RuntimeLinker::Clear() {
 	g_tls_cached_main_tcb     = nullptr;
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
+	m_ps4_symbols.reset();
 }
 
 void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* program,
@@ -1542,6 +1732,13 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_programs) {
+		if (p->ps4_module) {
+			for (const auto& segment: p->ps4_module->segments)
+				if (vaddr >= p->base_vaddr + segment.offset &&
+				    vaddr < p->base_vaddr + segment.offset + segment.size)
+					return p;
+			continue;
+		}
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
 
@@ -1585,7 +1782,7 @@ void RuntimeLinker::StopAllModules() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_programs) {
-		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
+		if (p->elf && p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
 			StopModule(p, 0, nullptr, nullptr);
 		}
 	}
@@ -2217,8 +2414,7 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 void RuntimeLinker::SetupTlsHandler(Program* program) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(g_tls_main_program != nullptr);
-	EXIT_IF(program->elf == nullptr);
-	EXIT_IF(program->elf->IsShared());
+	EXIT_IF(!program->ps4_module && (program->elf == nullptr || program->elf->IsShared()));
 	EXIT_IF(program->tls.handler_vaddr == 0);
 
 	g_tls_main_program = program;
