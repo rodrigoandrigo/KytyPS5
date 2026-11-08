@@ -1,17 +1,18 @@
 #include "libs/ps4Gnm.h"
 
+#include "graphics/guest_gpu/ps4Transfer.h"
 #include "graphics/shader/recompiler/GcnCompiler.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <future>
 #include <map>
 #include <thread>
-#include <future>
-#include <deque>
-#include <condition_variable>
 
 namespace Libs::Ps4 {
 namespace ShaderRecompiler = Graphics::ShaderRecompiler;
@@ -29,10 +30,17 @@ struct Target {
 	uint32_t             width, height;
 	std::vector<uint8_t> pixels;
 };
-struct DrawCall {
-	uint64_t                   target;
-	Graphics::Ps4::RasterState raster;
-	std::vector<uint32_t>      vertex, pixel;
+struct Operation {
+	uint64_t             buffer_address = 0, buffer_address2 = 0;
+	std::vector<uint8_t> pixel_buffer, pixel_buffer2;
+	uint64_t             vertex_address = 0, vertex_address2 = 0;
+	std::vector<uint8_t> vertex_buffer, vertex_buffer2, pixel_texels, vertex_texels;
+	ShaderRecompiler::Gcn::ImageDescriptor pixel_image, vertex_image;
+	uint64_t                               target;
+	Graphics::Ps4::RasterState             raster;
+	std::vector<uint32_t>                  vertex, pixel;
+	std::vector<uint32_t>                  transfer_packet;
+	Graphics::Ps4::TransferPlan            transfer;
 };
 bool Read(const GnmMemory& memory, uint64_t address, std::span<uint8_t> bytes) {
 	return address && bytes.size() <= MaxBytes && address <= UINT64_MAX - bytes.size() &&
@@ -63,7 +71,7 @@ void NopTo(std::vector<uint32_t>& out, size_t size) {
 	out.resize(size, 0);
 }
 bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> users, bool vertex,
-                    uint32_t rsrc1, std::string& error) {
+                    uint32_t rsrc1, std::string& error, uint32_t parameter_count) {
 	std::vector<uint32_t> normalized;
 	for (uint32_t i = 0; i < users.size(); ++i) {
 		normalized.push_back(0xbe8003ffu | i << 16);
@@ -74,10 +82,26 @@ bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> us
 	if (!ShaderRecompiler::Gcn::Decode(normalized,
 	                                   vertex ? ShaderRecompiler::Gcn::Stage::Vertex
 	                                          : ShaderRecompiler::Gcn::Stage::Pixel,
-	                                   program, error))
+	                                   program, error, parameter_count))
 		return false;
 	const uint32_t vectors = ((rsrc1 & 63) + 1) * 4, scalars = (((rsrc1 >> 6) & 15) + 1) * 8;
 	for (const auto& inst: program.instructions) {
+		if (inst.family == ShaderRecompiler::Decoder::Family::MIMG &&
+		    (inst.dst.reg + 4 > vectors || inst.src0.reg + 2 > vectors ||
+		     inst.src1.reg + 8 > scalars)) {
+			error = "IMAGE_LOAD register group exceeds declared allocation";
+			return false;
+		}
+		if (inst.family == ShaderRecompiler::Decoder::Family::MUBUF &&
+		    (inst.dst.reg + inst.data_dwords > vectors || inst.src1.reg + 4 > scalars)) {
+			error = "MUBUF register group exceeds declared allocation";
+			return false;
+		}
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_BUFFER_LOAD_DWORDX4 &&
+		    inst.dst.reg + 4 > scalars) {
+			error = "SMRD destination group exceeds declared SGPR allocation";
+			return false;
+		}
 		const ShaderRecompiler::Decoder::Operand operands[] {inst.dst, inst.src0, inst.src1,
 		                                                     inst.src2, inst.src3};
 		for (const auto& op: operands) {
@@ -95,6 +119,7 @@ bool KnownRegister(uint32_t reg, uint32_t value) {
 	if (reg >= 0xa318 && reg <= 0xa31d) return true;
 	if (reg >= 0xa31e && reg <= 0xa326) return value == 0 || reg == 0xa323 || reg == 0xa324;
 	if (reg >= 0xa10f && reg <= 0xa114) return true;
+	if (reg >= 0xa191 && reg < 0xa195) return true;
 	switch (reg) {
 		case 0xa00c:
 		case 0xa00d:
@@ -130,11 +155,11 @@ bool KnownRegister(uint32_t reg, uint32_t value) {
 } // namespace
 struct GnmSession::State {
 	mutable std::mutex                          mutex;
-	std::mutex queue_mutex, finish_mutex;
-	std::condition_variable wake;
-	std::deque<std::packaged_task<int32_t()>> jobs;
-	std::thread worker;
-	bool stopping = false;
+	std::mutex                                  queue_mutex, finish_mutex;
+	std::condition_variable                     wake;
+	std::deque<std::packaged_task<int32_t()>>   jobs;
+	std::thread                                 worker;
+	bool                                        stopping = false;
 	GnmMemory                                   memory;
 	Registers                                   registers;
 	std::unique_ptr<Graphics::Ps4::GnmRenderer> renderer;
@@ -150,7 +175,8 @@ struct GnmSession::State {
 };
 namespace {
 bool PrepareDraw(GnmSession::State& session, const Registers& registers, uint32_t count,
-                 std::map<uint64_t, Target>& targets, DrawCall& draw) {
+                 std::map<uint64_t, Target>& targets, Operation& draw,
+                 std::vector<std::pair<uint64_t, size_t>>& shader_ranges) {
 	const auto fail = [&](const std::string& reason) {
 		session.error = reason;
 		return false;
@@ -171,13 +197,23 @@ bool PrepareDraw(GnmSession::State& session, const Registers& registers, uint32_
 	uint32_t base, pitch, slice, info, attrib, screen, generic_tl, generic_br, target_mask, blend;
 	if (!registers.instances || !exact(0xc242, 4) || !exact(0xa200, 0) ||
 	    !exact(0xa202, 0xcc0010) || !exact(0xa203, 0) || !exact(0xa204, 1u << 19) ||
-	    !exact(0xa205, 0) || !exact(0xa206, 0x3f) || !exact(0xa207, 0) || !exact(0xa1b1, 0) ||
-	    !exact(0xa1c3, 4) || !exact(0xa1c4, 0) || !exact(0xa1c5, 9) || !exact(0xa1b3, 0) ||
-	    !exact(0xa1b4, 0) || !exact(0xa1b6, 0) || !exact(0xa1b8, 0) || !exact(0xa08f, 15) ||
+	    !exact(0xa205, 0) || !exact(0xa206, 0x3f) || !exact(0xa207, 0) || !exact(0xa1c3, 4) ||
+	    !exact(0xa1c4, 0) || !exact(0xa1c5, 9) || !exact(0xa1b8, 0) || !exact(0xa08f, 15) ||
 	    !exact(0xa31b, 0) || !exact(0xa00c, 0) || !exact(0xa080, 0) || !exact(0xa081, 0x80000000) ||
 	    !exact(0xa0b4, 0) || !exact(0xa0b5, 0x3f800000))
 		return fail(session.error.empty() ? "NUM_INSTANCES must be explicitly set to one"
 		                                  : session.error);
+	uint32_t parameter_count, input_enable, input_address;
+	if (!get(0xa1b6, parameter_count) || parameter_count > 4 ||
+	    !exact(0xa1b1, parameter_count ? (parameter_count - 1) << 1 : 0) ||
+	    !get(0xa1b3, input_enable) || !get(0xa1b4, input_address) ||
+	    input_enable != input_address ||
+	    (parameter_count ? (input_enable != 2 && input_enable != 32) : input_enable != 0))
+		return fail("unsupported GNM interpolator count/enable/export configuration");
+	std::array<uint32_t, 4> parameter_map {};
+	for (uint32_t i = 0; i < parameter_count; ++i)
+		if (!get(0xa191 + i, parameter_map[i]) || parameter_map[i] >= parameter_count)
+			return fail("unsupported GNM smooth PARAM mapping");
 	if (!get(0xa318, base) || !get(0xa319, pitch) || !get(0xa31a, slice) || !get(0xa31c, info) ||
 	    !get(0xa31d, attrib) || !get(0xa00d, screen) || !get(0xa090, generic_tl) ||
 	    !get(0xa091, generic_br) || !get(0xa08e, target_mask) || !get(0xa1e0, blend))
@@ -252,11 +288,40 @@ bool PrepareDraw(GnmSession::State& session, const Registers& registers, uint32_
 				return fail("GCN shader unreadable: " + compile_error);
 			code.push_back(word);
 			if (word != 0xbf810000u) continue;
-			if (ShaderRecompiler::Gcn::Compile(code,
-			                                   vertex ? ShaderRecompiler::Gcn::Stage::Vertex
-			                                          : ShaderRecompiler::Gcn::Stage::Pixel,
-			                                   spirv, compile_error, data)) {
-				if (!RegisterLimits(code, data, vertex, rsrc1, session.error)) return false;
+			ShaderRecompiler::Gcn::BufferDescriptor              buffer;
+			std::vector<ShaderRecompiler::Gcn::BufferDescriptor> resources;
+			ShaderRecompiler::Gcn::ImageDescriptor               texture;
+			if (ShaderRecompiler::Gcn::Compile(
+			        code,
+			        vertex ? ShaderRecompiler::Gcn::Stage::Vertex
+			               : ShaderRecompiler::Gcn::Stage::Pixel,
+			        spirv, compile_error, data, parameter_count, &buffer,
+			        std::span<const uint32_t>(parameter_map).first(parameter_count),
+			        input_enable == 32, &resources, &texture)) {
+				if (!RegisterLimits(code, data, vertex, rsrc1, session.error, parameter_count))
+					return false;
+				if (buffer.size) {
+					for (size_t index = 0; index < resources.size(); ++index) {
+						const auto& resource = resources[index];
+						auto& snapshot = vertex ? (index ? draw.vertex_buffer2 : draw.vertex_buffer)
+						                        : (index ? draw.pixel_buffer2 : draw.pixel_buffer);
+						(vertex ? (index ? draw.vertex_address2 : draw.vertex_address)
+						        : (index ? draw.buffer_address2 : draw.buffer_address)) =
+						    resource.address;
+						snapshot.resize(resource.size);
+						if (!Read(session.memory, resource.address, snapshot))
+							return fail("PS4 shader buffer unreadable");
+					}
+				}
+				if (texture.size) {
+					auto& descriptor = vertex ? draw.vertex_image : draw.pixel_image;
+					auto& pixels     = vertex ? draw.vertex_texels : draw.pixel_texels;
+					descriptor       = texture;
+					pixels.resize(texture.size);
+					if (!Read(session.memory, texture.address, pixels))
+						return fail("PS4 image payload unreadable");
+				}
+				shader_ranges.emplace_back(address, code.size() * 4);
 				return true;
 			}
 		}
@@ -305,17 +370,18 @@ GnmSession::Create(GnmMemory memory, std::string& error,
 		error = "GNM session already active";
 		return {};
 	}
-	auto state      = std::make_unique<State>();
-	state->memory   = std::move(memory);
-	state->renderer = std::move(renderer);
-	auto session    = std::shared_ptr<GnmSession>(new GnmSession(std::move(state)));
-	auto* worker_state = session->m_state.get();
+	auto state           = std::make_unique<State>();
+	state->memory        = std::move(memory);
+	state->renderer      = std::move(renderer);
+	auto  session        = std::shared_ptr<GnmSession>(new GnmSession(std::move(state)));
+	auto* worker_state   = session->m_state.get();
 	worker_state->worker = std::thread([worker_state] {
 		for (;;) {
 			std::packaged_task<int32_t()> job;
 			{
 				std::unique_lock lock(worker_state->queue_mutex);
-				worker_state->wake.wait(lock, [&] { return worker_state->stopping || !worker_state->jobs.empty(); });
+				worker_state->wake.wait(
+				    lock, [&] { return worker_state->stopping || !worker_state->jobs.empty(); });
 				if (worker_state->jobs.empty()) return;
 				job = std::move(worker_state->jobs.front());
 				worker_state->jobs.pop_front();
@@ -323,13 +389,14 @@ GnmSession::Create(GnmMemory memory, std::string& error,
 			job();
 		}
 	});
-	current         = session;
+	current              = session;
 	return session;
 }
 int32_t GnmSession::Submit(uint32_t count, uint64_t dcbs, uint64_t sizes, uint64_t ccbs,
                            uint64_t cc_sizes) {
-	auto& s = *m_state;
-	std::packaged_task<int32_t()> job([=, this] { return SubmitOnWorker(count, dcbs, sizes, ccbs, cc_sizes); });
+	auto&                         s = *m_state;
+	std::packaged_task<int32_t()> job(
+	    [=, this] { return SubmitOnWorker(count, dcbs, sizes, ccbs, cc_sizes); });
 	auto result = job.get_future();
 	{
 		std::lock_guard lock(s.queue_mutex);
@@ -340,7 +407,7 @@ int32_t GnmSession::Submit(uint32_t count, uint64_t dcbs, uint64_t sizes, uint64
 	return result.get();
 }
 int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes, uint64_t ccbs,
-                           uint64_t cc_sizes) {
+                                   uint64_t cc_sizes) {
 	auto&           s = *m_state;
 	std::lock_guard lock(s.mutex);
 	s.error.clear();
@@ -374,9 +441,12 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 		          {reinterpret_cast<uint8_t*>(buffers.back().data()), lengths[i]}))
 			return s.Reject("unreadable GNM DCB");
 	}
-	auto                       registers = s.registers;
-	std::vector<DrawCall>      draws;
-	std::map<uint64_t, Target> targets;
+	auto                                     registers = s.registers;
+	std::vector<Operation>                   operations;
+	std::map<uint64_t, Target>               targets;
+	std::vector<std::pair<uint64_t, size_t>> shader_ranges;
+	uint32_t                                 draw_count = 0, transfer_count = 0;
+	uint64_t                                 resource_bytes = 0;
 	for (const auto& commands: buffers)
 		for (size_t pc = 0; pc < commands.size();) {
 			const uint32_t header = commands[pc];
@@ -400,27 +470,112 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 				if (words != 2 || commands[pc + 1] != 1)
 					return s.Reject("only one GNM instance is supported");
 				registers.instances = true;
+			} else if (op == 0x37 || op == 0x50) {
+				if (++transfer_count > 4096) return s.Reject("GNM transfer count budget exceeded");
+				Operation operation {};
+				operation.transfer_packet.assign(commands.begin() + pc,
+				                                 commands.begin() + pc + words);
+				operations.push_back(std::move(operation));
 			} else if (op == 0x2d) {
-				if (words != 3 || commands[pc + 2] != 2 || draws.size() >= 64)
+				if (words != 3 || commands[pc + 2] != 2 || draw_count >= 64)
 					return s.Reject("unsupported draw mode/budget");
-				DrawCall draw;
-				if (!PrepareDraw(s, registers, commands[pc + 1], targets, draw))
+				Operation draw;
+				if (!PrepareDraw(s, registers, commands[pc + 1], targets, draw, shader_ranges))
 					return s.Reject(s.error);
-				draws.push_back(std::move(draw));
+				resource_bytes += draw.pixel_buffer.size() + draw.pixel_buffer2.size() +
+				                  draw.vertex_buffer.size() + draw.vertex_buffer2.size() +
+				                  draw.pixel_texels.size() + draw.vertex_texels.size();
+				if (resource_bytes > 16 * 1024 * 1024)
+					return s.Reject("shader resource snapshot byte budget exceeded");
+				++draw_count;
+				operations.push_back(std::move(draw));
 			} else
 				return s.Reject("unsupported PS4 PM4 opcode " + std::to_string(op) + " at dword " +
 				                std::to_string(pc));
 			pc += words;
 		}
-	if (!draws.empty() && !s.renderer) {
+	for (const auto& operation: operations) {
+		const std::pair<uint64_t, size_t> ranges[] = {
+		    {operation.buffer_address, operation.pixel_buffer.size()},
+		    {operation.buffer_address2, operation.pixel_buffer2.size()},
+		    {operation.vertex_address, operation.vertex_buffer.size()},
+		    {operation.vertex_address2, operation.vertex_buffer2.size()},
+		    {operation.pixel_image.address, operation.pixel_texels.size()},
+		    {operation.vertex_image.address, operation.vertex_texels.size()}};
+		for (auto [base, bytes]: ranges) {
+			if (!bytes) continue;
+			for (const auto& [address, target]: targets)
+				if (base <= address ? address - base < bytes
+				                    : base - address < target.pixels.size())
+					return s.Reject("shader resource aliases a draw target in this batch");
+		}
+	}
+	// Resolve transfers only after every target and draw has been validated. Commands
+	// and shaders are snapshots: reject mixed batches whose outputs could alter either.
+	if (transfer_count) {
+		const auto overlaps = [](uint64_t a, size_t an, uint64_t b, size_t bn) {
+			return a <= b ? b - a < an : a - b < bn;
+		};
+		for (const auto& [address, target]: targets) {
+			for (const auto& [shader, bytes]: shader_ranges)
+				if (overlaps(address, target.pixels.size(), shader, bytes))
+					return s.Reject("GNM mixed-batch target aliases shader code");
+			for (uint32_t i = 0; i < count; ++i)
+				if (overlaps(address, target.pixels.size(), addresses[i], lengths[i]))
+					return s.Reject("GNM mixed-batch target aliases command buffer");
+			if (overlaps(address, target.pixels.size(), dcbs, count * 8) ||
+			    overlaps(address, target.pixels.size(), sizes, count * 4))
+				return s.Reject("GNM mixed-batch target aliases command arrays");
+		}
+		size_t transfer_bytes = 0;
+		for (auto& operation: operations) {
+			const auto& packet = operation.transfer_packet;
+			if (packet.empty()) continue;
+			const bool write = ((packet[0] >> 8) & 255) == 0x37;
+			if ((write && packet.size() < 5) || (!write && packet.size() != 7))
+				return s.Reject("invalid GNM transfer packet length");
+			const uint64_t destination = write ? packet[2] | (uint64_t(packet[3]) << 32)
+			                                   : packet[4] | (uint64_t(packet[5]) << 32);
+			auto           target      = targets.upper_bound(destination);
+			if (target == targets.begin()) return s.Reject("GNM transfer has no draw target");
+			--target;
+			const auto& t = target->second;
+			if (destination - target->first >= t.pixels.size())
+				return s.Reject("GNM transfer outside validated draw target");
+			if (!Graphics::Ps4::DecodeTransfers(packet,
+			                                    {target->first, t.width, t.height, t.width * 4},
+			                                    operation.transfer, s.error))
+				return s.Reject(s.error);
+			for (const auto& write: operation.transfer.writes) {
+				if (write.words.size() * 4 > 16 * 1024 * 1024 - transfer_bytes)
+					return s.Reject("GNM transfer byte budget exceeded");
+				transfer_bytes += write.words.size() * 4;
+			}
+			operation.target = target->first;
+		}
+	}
+	if (draw_count && !s.renderer) {
 		s.renderer = Graphics::Ps4::CreateGnmRenderer(s.error);
 		if (!s.renderer) return s.Reject(s.error);
 		std::fprintf(stderr, "PS4 GNM renderer: %s\n", s.renderer->Name());
 	}
-	for (auto& draw: draws) {
-		auto& target         = targets.at(draw.target);
-		auto  state          = draw.raster;
+	for (auto& draw: operations) {
+		auto& target = targets.at(draw.target);
+		if (!draw.transfer_packet.empty()) {
+			if (!Graphics::Ps4::ApplyTransfers(draw.transfer, target.pixels, s.error))
+				return s.Reject(s.error);
+			continue;
+		}
+		auto state           = draw.raster;
 		state.initial_pixels = target.pixels;
+		state.pixel_buffer   = draw.pixel_buffer;
+		state.pixel_buffer2  = draw.pixel_buffer2;
+		state.vertex_buffer  = draw.vertex_buffer;
+		state.vertex_buffer2 = draw.vertex_buffer2;
+		state.pixel_texture  = {draw.pixel_image.width, draw.pixel_image.height,
+		                        draw.pixel_image.pitch, draw.pixel_texels};
+		state.vertex_texture = {draw.vertex_image.width, draw.vertex_image.height,
+		                        draw.vertex_image.pitch, draw.vertex_texels};
 		std::vector<uint8_t> pixels;
 		if (!s.renderer->Render(state, draw.vertex, draw.pixel, pixels, s.error) ||
 		    pixels.size() != target.pixels.size())
@@ -435,7 +590,7 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 			return s.Reject("GNM framebuffer commit failed");
 	s.registers = std::move(registers);
 	++s.stats.submissions;
-	s.stats.draws += draws.size();
+	s.stats.draws += draw_count;
 	return 0;
 }
 int32_t GnmSession::SetShader(bool vertex, uint64_t commands, uint32_t size, uint64_t registers,
@@ -491,7 +646,7 @@ int32_t GnmSession::Done() {
 	return s.finished ? s.Reject("GNM session finished") : 0;
 }
 void GnmSession::Finish() {
-	auto& s = *m_state;
+	auto&           s = *m_state;
 	std::lock_guard finish_lock(s.finish_mutex);
 	{
 		std::lock_guard queue_lock(s.queue_mutex);

@@ -27,6 +27,9 @@ struct TransferPlan {
 bool DecodeTransfers(std::span<const uint32_t> commands, LinearTarget target, TransferPlan& output,
                      std::string& error);
 bool ValidatePlan(const TransferPlan& plan, std::string& error);
+// Apply an entirely validated plan to a private CPU snapshot, never guest memory.
+// The caller orders uploads/draws/readbacks and commits only after GPU success.
+bool ApplyTransfers(const TransferPlan& plan, std::span<uint8_t> pixels, std::string& error);
 // Own fixture; genuine type-3 packets, a fill followed by ordered row overwrites.
 std::vector<uint32_t> MakeTransferFixture(LinearTarget target);
 std::vector<uint8_t>  ExpectedTransferFixture(LinearTarget target);

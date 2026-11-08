@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/ps4Transfer.h"
 
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics::Ps4 {
@@ -43,6 +44,16 @@ bool ValidatePlan(const TransferPlan& plan, std::string& error) {
 			return Fail(error, "Invalid transfer plan range or budget");
 		total += write.words.size() * 4;
 	}
+	return true;
+}
+
+bool ApplyTransfers(const TransferPlan& plan, std::span<uint8_t> pixels, std::string& error) {
+	if (!ValidatePlan(plan, error)) return false;
+	if (pixels.size() != size_t(plan.target.pitch) * plan.target.height)
+		return Fail(error, "Transfer snapshot size mismatch");
+	for (const auto& write: plan.writes)
+		if (!write.words.empty())
+			std::memcpy(pixels.data() + write.offset, write.words.data(), write.words.size() * 4);
 	return true;
 }
 

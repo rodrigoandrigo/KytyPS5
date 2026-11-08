@@ -24,14 +24,26 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		return false;
 	}
 	try {
-		D3D12_ROOT_PARAMETER parameter {};
-		parameter.ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-		parameter.Constants.Num32BitValues = 12;
-		parameter.Constants.RegisterSpace  = 1001;
+		const bool has_resources = !s.pixel_buffer.empty() || !s.vertex_buffer.empty() ||
+		                           !s.pixel_texture.pixels.empty() ||
+		                           !s.vertex_texture.pixels.empty();
+		D3D12_ROOT_PARAMETER parameters[4] {};
+		parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		parameters[0].Constants     = {0, 1001, 12};
+		D3D12_DESCRIPTOR_RANGE ranges[2] {};
+		ranges[0]                     = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 58, 0, 0};
+		ranges[1]                     = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 64, 0, 0};
+		parameters[1].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		parameters[1].DescriptorTable = {1, &ranges[0]};
+		parameters[2].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		parameters[2].Constants       = {0, 1000, 8};
+		parameters[3].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		parameters[3].DescriptorTable = {1, &ranges[1]};
 		D3D12_ROOT_SIGNATURE_DESC root_desc {};
-		root_desc.NumParameters = 1;
-		root_desc.pParameters   = &parameter;
+		root_desc.NumParameters = has_resources ? 4 : 1;
+		root_desc.pParameters   = parameters;
 		root_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
 		ComPtr<ID3DBlob> blob, errors;
 		CheckRaster(
 		    D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors),
@@ -83,8 +95,10 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		std::memcpy(clear.Color, s.clear, sizeof(s.clear));
 		ComPtr<ID3D12Resource> target, readback, upload;
 		CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-		                                            s.initial_pixels.empty() ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST, &clear,
-		                                            IID_PPV_ARGS(&target)),
+		                                            s.initial_pixels.empty()
+		                                                ? D3D12_RESOURCE_STATE_RENDER_TARGET
+		                                                : D3D12_RESOURCE_STATE_COPY_DEST,
+		                                            &clear, IID_PPV_ARGS(&target)),
 		            "Create GCN raster target");
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
 		UINT64                             bytes = 0;
@@ -103,11 +117,15 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		if (!s.initial_pixels.empty()) {
 			heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 			CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
-			            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)), "Create initial framebuffer upload");
-			void* data; const D3D12_RANGE empty {0, 0};
+			                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			                                            IID_PPV_ARGS(&upload)),
+			            "Create initial framebuffer upload");
+			void*             data;
+			const D3D12_RANGE empty {0, 0};
 			CheckRaster(upload->Map(0, &empty, &data), "Map initial framebuffer");
 			for (uint32_t y = 0; y < s.height; ++y)
-				std::memcpy(static_cast<uint8_t*>(data) + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
+				std::memcpy(static_cast<uint8_t*>(data) + footprint.Offset +
+				                size_t(y) * footprint.Footprint.RowPitch,
 				            s.initial_pixels.data() + size_t(y) * s.width * 4, size_t(s.width) * 4);
 			upload->Unmap(0, nullptr);
 		}
@@ -119,6 +137,126 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		            "Create raster RTV heap");
 		const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
 		device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+		ComPtr<ID3D12Resource>         shader_buffer[4], shader_upload[4];
+		ComPtr<ID3D12DescriptorHeap>   shader_heap;
+		const std::span<const uint8_t> payloads[]   = {s.pixel_buffer, s.pixel_buffer2,
+		                                               s.vertex_buffer, s.vertex_buffer2};
+		const UINT                     buffer_count = 4;
+		const UINT                     increment =
+		    device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		if (has_resources) {
+			D3D12_DESCRIPTOR_HEAP_DESC views {};
+			views.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			views.NumDescriptors = 6;
+			views.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+			CheckRaster(device->CreateDescriptorHeap(&views, IID_PPV_ARGS(&shader_heap)),
+			            "Create resource SRV heap");
+			for (UINT i = 0; i < 6; ++i) {
+				D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+				srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+				if (i < 4) {
+					srv.Format             = DXGI_FORMAT_R32_TYPELESS;
+					srv.ViewDimension      = D3D12_SRV_DIMENSION_BUFFER;
+					srv.Buffer.NumElements = 4;
+					srv.Buffer.Flags       = D3D12_BUFFER_SRV_FLAG_RAW;
+				} else {
+					srv.Format              = DXGI_FORMAT_R8G8B8A8_UNORM;
+					srv.ViewDimension       = D3D12_SRV_DIMENSION_TEXTURE2D;
+					srv.Texture2D.MipLevels = 1;
+				}
+				auto handle = shader_heap->GetCPUDescriptorHandleForHeapStart();
+				handle.ptr += SIZE_T(i) * increment;
+				device->CreateShaderResourceView(nullptr, &srv, handle);
+			}
+		}
+		for (UINT i = 0; i < buffer_count; ++i) {
+			if (payloads[i].empty()) continue;
+			D3D12_HEAP_PROPERTIES gpu_heap {}, cpu_heap {};
+			gpu_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			cpu_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+			D3D12_RESOURCE_DESC desc {};
+			desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+			desc.Width            = payloads[i].size();
+			desc.Height           = 1;
+			desc.DepthOrArraySize = desc.MipLevels = 1;
+			desc.SampleDesc.Count                  = 1;
+			desc.Layout                            = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			CheckRaster(device->CreateCommittedResource(&gpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
+			                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+			                                            IID_PPV_ARGS(&shader_buffer[i])),
+			            "Create shader buffer");
+			CheckRaster(device->CreateCommittedResource(&cpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
+			                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			                                            IID_PPV_ARGS(&shader_upload[i])),
+			            "Create shader upload");
+			void*       data;
+			D3D12_RANGE empty {};
+			CheckRaster(shader_upload[i]->Map(0, &empty, &data), "Map shader buffer");
+			std::memcpy(data, payloads[i].data(), payloads[i].size());
+			shader_upload[i]->Unmap(0, nullptr);
+			D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+			srv.Format                  = DXGI_FORMAT_R32_TYPELESS;
+			srv.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
+			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srv.Buffer.NumElements      = UINT(payloads[i].size() / 4);
+			srv.Buffer.Flags            = D3D12_BUFFER_SRV_FLAG_RAW;
+			auto handle                 = shader_heap->GetCPUDescriptorHandleForHeapStart();
+			handle.ptr += SIZE_T(i) * device->GetDescriptorHandleIncrementSize(
+			                              D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			device->CreateShaderResourceView(shader_buffer[i].Get(), &srv, handle);
+		}
+
+		ComPtr<ID3D12Resource>             textures[2], texture_uploads[2];
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT texture_footprints[2] {};
+		const Ps4::Texture2D               image_payloads[] = {s.pixel_texture, s.vertex_texture};
+		for (UINT i = 0; i < 2; ++i) {
+			const auto& t = image_payloads[i];
+			if (t.pixels.empty()) continue;
+			D3D12_RESOURCE_DESC desc {};
+			desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			desc.Width            = t.width;
+			desc.Height           = t.height;
+			desc.DepthOrArraySize = desc.MipLevels = 1;
+			desc.Format                            = DXGI_FORMAT_R8G8B8A8_UNORM;
+			desc.SampleDesc.Count                  = 1;
+			D3D12_HEAP_PROPERTIES heap {};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+			                                            IID_PPV_ARGS(&textures[i])),
+			            "Create shader image");
+			UINT64 bytes = 0;
+			device->GetCopyableFootprints(&desc, 0, 1, 0, &texture_footprints[i], nullptr, nullptr,
+			                              &bytes);
+			desc                  = {};
+			desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+			desc.Width            = bytes;
+			desc.Height           = 1;
+			desc.DepthOrArraySize = desc.MipLevels = 1;
+			desc.SampleDesc.Count                  = 1;
+			desc.Layout                            = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			heap.Type                              = D3D12_HEAP_TYPE_UPLOAD;
+			CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			                                            IID_PPV_ARGS(&texture_uploads[i])),
+			            "Create image upload");
+			void*       data;
+			D3D12_RANGE empty {};
+			CheckRaster(texture_uploads[i]->Map(0, &empty, &data), "Map image upload");
+			for (UINT y = 0; y < t.height; ++y)
+				std::memcpy(static_cast<uint8_t*>(data) + texture_footprints[i].Offset +
+				                size_t(y) * texture_footprints[i].Footprint.RowPitch,
+				            t.pixels.data() + size_t(y) * t.pitch, size_t(t.width) * 4);
+			texture_uploads[i]->Unmap(0, nullptr);
+			D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+			srv.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+			srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srv.Texture2D.MipLevels     = 1;
+			auto handle                 = shader_heap->GetCPUDescriptorHandleForHeapStart();
+			handle.ptr += SIZE_T(4 + i) * increment;
+			device->CreateShaderResourceView(textures[i].Get(), &srv, handle);
+		}
 		ComPtr<ID3D12CommandAllocator>    allocator;
 		ComPtr<ID3D12GraphicsCommandList> list;
 		ComPtr<ID3D12Fence>               fence;
@@ -134,19 +272,65 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		uint32_t runtime[12] {};
 		runtime[3] = 1; // Y flip, matching Vulkan's positive-height viewport.
 		list->SetGraphicsRoot32BitConstants(0, 12, runtime, 0);
+		if (has_resources) {
+			for (UINT i = 0; i < buffer_count; ++i) {
+				if (payloads[i].empty()) continue;
+				list->CopyBufferRegion(shader_buffer[i].Get(), 0, shader_upload[i].Get(), 0,
+				                       payloads[i].size());
+				D3D12_RESOURCE_BARRIER barrier {};
+				barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrier.Transition = {shader_buffer[i].Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST,
+				                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+				                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+				list->ResourceBarrier(1, &barrier);
+			}
+			ID3D12DescriptorHeap* heaps[] = {shader_heap.Get()};
+			list->SetDescriptorHeaps(1, heaps);
+			list->SetGraphicsRootDescriptorTable(1,
+			                                     shader_heap->GetGPUDescriptorHandleForHeapStart());
+			auto image_table = shader_heap->GetGPUDescriptorHandleForHeapStart();
+			image_table.ptr += UINT64(4) * increment;
+			list->SetGraphicsRootDescriptorTable(3, image_table);
+			const uint32_t metadata[] = {
+			    0, uint32_t(s.pixel_buffer.size()),  uint32_t(s.pixel_buffer2.size()),  0,
+			    0, uint32_t(s.vertex_buffer.size()), uint32_t(s.vertex_buffer2.size()), 0};
+			list->SetGraphicsRoot32BitConstants(2, 8, metadata, 0);
+			for (UINT i = 0; i < 2; ++i) {
+				if (!textures[i]) continue;
+				D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
+				src.pResource       = texture_uploads[i].Get();
+				src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+				src.PlacedFootprint = texture_footprints[i];
+				dst.pResource       = textures[i].Get();
+				dst.Type            = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+				D3D12_RESOURCE_BARRIER barrier {};
+				barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrier.Transition = {textures[i].Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST,
+				                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+				                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+				list->ResourceBarrier(1, &barrier);
+			}
+		}
 		const D3D12_VIEWPORT viewport {0, 0, float(s.width), float(s.height), 0, 1};
 		const D3D12_RECT     scissor {LONG(s.left), LONG(s.top), LONG(s.right), LONG(s.bottom)};
 		list->RSSetViewports(1, &viewport);
 		list->RSSetScissorRects(1, &scissor);
 		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-		if (s.initial_pixels.empty()) list->ClearRenderTargetView(rtv, s.clear, 0, nullptr);
+		if (s.initial_pixels.empty())
+			list->ClearRenderTargetView(rtv, s.clear, 0, nullptr);
 		else {
 			D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
-			src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = footprint;
-			dst.pResource = target.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			src.pResource       = upload.Get();
+			src.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			src.PlacedFootprint = footprint;
+			dst.pResource       = target.Get();
+			dst.Type            = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-			D3D12_RESOURCE_BARRIER initial_barrier {}; initial_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			initial_barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET};
+			D3D12_RESOURCE_BARRIER initial_barrier {};
+			initial_barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			initial_barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST,
+			                              D3D12_RESOURCE_STATE_RENDER_TARGET};
 			list->ResourceBarrier(1, &initial_barrier);
 		}
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

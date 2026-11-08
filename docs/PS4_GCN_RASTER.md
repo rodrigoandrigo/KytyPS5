@@ -1,5 +1,23 @@
 # PS4 GCN e rasterização — contrato do incremento
 
+Atualização 2026-11-08: [IMAGE_LOAD RGBA8 e recursos VS/PS simultâneos](PS4_TEXTURES.md) validados: até dois buffers e uma textura por estágio, ELF com seis payloads, 25/25 testes, Vulkan/D3D12/WARP e build UWP aprovados. Samplers/filtragem, demais formatos/tiling e fase 4 geral permanecem incompletos.
+
+
+Atualização 2026-11-08: [MUBUF indexado, dois buffers e vertex fetch](PS4_MUBUF.md) implementados e validados no contrato limitado: 24/24 testes, ELF guest com índice/dados mutáveis, Vulkan/D3D12/WARP e build UWP aprovados. Texturas/MIMG, buffers simultâneos VS+PS e a fase 4 geral continuam incompletos.
+
+
+Atualização 2026-11-08: [interpolação e cobertura GCN](PS4_GCN_COVERAGE.md): mapa smooth PARAM e interpolação linear central integrados ao GNM; sete VOP1 adicionais exercitadas com buffer GPU real. 23/23 testes, Vulkan/D3D12/WARP e build UWP aprovados nos níveis documentados. Todas as famílias GCN e a fase 4 continuam incompletas.
+
+
+Atualização 2026-11-08: [descriptor e SMRD com buffer GPU real](PS4_GCN_BUFFERS.md) validados no contrato inicial de um buffer read-only no PS, com offset imediato. ELF guest altera os dados entre submissões; 23/23 testes, probes Vulkan/D3D12/WARP e build UWP aprovados nos níveis documentados. P1/P2 gerais e fase 4 continuam parciais.
+
+Incremento validado em 2026-11-08: [transferências no GNM](PS4_GNM_TRANSFERS.md) integra WRITE_DATA/DMA_DATA immediate-fill aos draws, limitado aos alvos atuais e com staging síncrono. ELF guest e 22/22 testes aprovados; Vulkan/D3D12/WARP e build UWP verificados nos níveis descritos no relatório. Recursos gerais e apresentação continuam pendentes.
+
+Atualização de shaders em 2026-11-08: implementados exports PARAM, interpolação perspectiva VS→PS e ALU VOP3 limitada, integrados ao estado GNM e exercitados em GPU. Contrato atual e limitações em [PS4_GNM.md](PS4_GNM.md) e evidências em PROGRESS.md. Shaders gerais completos, buffers e texturas continuam pendentes. Os relatos anteriores abaixo preservam os resultados de cada incremento.
+
+Atualização 2026-11-08: SGPRs, ALU escalar, branches para frente e integração GNM limitada estão descritos em [PS4_GNM.md](PS4_GNM.md). Os detalhes abaixo registram o incremento anterior.
+
+
 Este incremento acrescenta shaders GCN e draw ao diagnóstico gráfico da etapa 4. O alvo é um triângulo gerado por vertex ID, sem fetch shader, texturas ou recursos de jogos. O suporte comercial e a submissão GNM pelo runtime continuam separados.
 
 ## Frontend e IR

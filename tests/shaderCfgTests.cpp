@@ -1146,7 +1146,7 @@ void TestNormalizedImageContracts() {
   container.pixel_format = vk::Format::eR8G8B8A8Unorm;
   container.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
   container.type = Prospero::ImageType::kColor2D;
-  container.extent = {256, 256, 1};
+  container.extent = vk::Extent3D {256, 256, 1};
   container.resources = {9, 100};
   container.pitch = 256;
   container.bytes_per_block = 4;
@@ -1176,7 +1176,7 @@ void TestNormalizedImageContracts() {
 
   auto smaller = subresource;
   smaller.data = {0x241747000, 0x10000};
-  smaller.extent = {128, 128, 1};
+  smaller.extent = vk::Extent3D {128, 128, 1};
   smaller.pitch = 128;
   smaller.mip_layout[0] = {0, 0x10000, 128, 128};
   Check(smaller.MipOf(container) == 1 && smaller.SliceOf(container, 1) == 0,
@@ -1206,7 +1206,7 @@ void TestNormalizedImageContracts() {
 
   auto small_atlas = container;
   small_atlas.data = {0x239001000, 0x64000};
-  small_atlas.extent = {32, 32, 1};
+  small_atlas.extent = vk::Extent3D {32, 32, 1};
   small_atlas.pitch = 32;
   small_atlas.resources = {6, 50};
   small_atlas.mip_layout[0] = {0x1000, 0x32000, 32, 32};
@@ -1215,7 +1215,7 @@ void TestNormalizedImageContracts() {
   }
   auto small_child = subresource;
   small_child.data = {0x23900e000, 0x1000};
-  small_child.extent = {32, 32, 1};
+  small_child.extent = vk::Extent3D {32, 32, 1};
   small_child.pitch = 32;
   small_child.mip_layout[0] = {0, 0x1000, 32, 32};
   Check(small_child.MipOf(small_atlas) == 0 &&
@@ -1259,7 +1259,7 @@ void TestRebasedTextureMipViews() {
   chain.data.address = 0x5032b23000;
   chain.pixel_format = vk::Format::eR16G16B16A16Sfloat;
   chain.guest_format = format;
-  chain.extent = {256, 256, 1};
+  chain.extent = vk::Extent3D {256, 256, 1};
   chain.resources = {9, 2};
   chain.tile_mode = tile;
   chain.UpdateSize();
@@ -1272,7 +1272,7 @@ void TestRebasedTextureMipViews() {
     auto view = chain;
     view.data = {chain.data.address + layer * chain.tiled_slice_stride +
                      offsets[level], 0};
-    view.extent = {256u >> level, 256u >> level, 1};
+    view.extent = vk::Extent3D {256u >> level, 256u >> level, 1};
     view.resources = {1, 1};
     view.pitch = 0;
     view.UpdateSize();
@@ -1322,7 +1322,7 @@ void TestRebasedTextureMipViews() {
     view.data = {chain.data.address, 0};
     view.pitch = 0;
     switch (variant) {
-    case 0: view.extent = {7, 16, 1}; break; // Unproven non-power-of-two view.
+    case 0: view.extent = vk::Extent3D {7, 16, 1}; break; // Unproven non-power-of-two view.
     case 1: view.resources.levels = 2; break;
     case 2: view.resources.layers = 2; break;
     case 3: view.type = Prospero::ImageType::kColor3D; break;
@@ -1335,7 +1335,7 @@ void TestRebasedTextureMipViews() {
                                        : Prospero::BufferFormat::k16UNorm;
       view.pixel_format = variant == 7 ? vk::Format::eR8Unorm : vk::Format::eR16Unorm;
       view.bytes_per_block = 0;
-      view.extent = {1, 1, 1};
+      view.extent = vk::Extent3D {1, 1, 1};
       break;
     }
     view.UpdateSize();
@@ -1359,13 +1359,13 @@ void TestRebasedTextureMipViews() {
   sparse_chain.data = {0x503225f000, 0};
   sparse_chain.pixel_format = vk::Format::eR32G32B32A32Uint;
   sparse_chain.guest_format = Prospero::BufferFormat::k32_32_32_32UInt;
-  sparse_chain.extent = {64, 64, 1};
+  sparse_chain.extent = vk::Extent3D {64, 64, 1};
   sparse_chain.resources = {6, 7};
   sparse_chain.pitch = sparse_chain.bytes_per_block = 0;
   sparse_chain.UpdateSize();
   auto sparse = sparse_chain;
   sparse.data = {0x50322e3500, 0};
-  sparse.extent = {2, 2, 1};
+  sparse.extent = vk::Extent3D {2, 2, 1};
   sparse.resources = {1, 1};
   sparse.pitch = 0;
   sparse.UpdateSize();

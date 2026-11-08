@@ -287,6 +287,13 @@ uint64_t Word(uint64_t address, size_t size = 8) {
 } // namespace
 int main(int argc, char** argv) {
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	const bool emit    = argc == 3 && std::string_view(argv[1]) == "--emit-fixture";
+	const bool profile = argc == 3 && std::string_view(argv[1]) == "--run-profile";
+	if (argc != 1 && !emit && !profile) {
+		std::fprintf(stderr, "Usage: ps4_runtime_tests [--emit-fixture|--run-profile <folder>]\n");
+		return 2;
+	}
+
 	const auto root =
 	    argc == 3
 	        ? std::filesystem::absolute(argv[2])
@@ -298,8 +305,8 @@ int main(int argc, char** argv) {
 	Write(root / "app0/eboot.bin", bytes);
 	Write(root / "app0/sce_sys/param.sfo", GuestPlatformTests::Sfo());
 	Write(root / "app0/input.bin", {0x12, 0x34, 0x56, 0x78});
-	if (argc == 3 && std::string_view(argv[1]) == "--emit-fixture") return 0;
-	if (argc == 3 && std::string_view(argv[1]) == "--run-profile") {
+	if (emit) return 0;
+	if (profile) {
 		Common::InitializeThreads();
 		Emulator::RunOptions options;
 		options.ps4_runtime             = true;
@@ -394,6 +401,11 @@ int main(int argc, char** argv) {
 	}
 	rt->Clear();
 	subsystems.Destroy();
+	const auto temporary =
+	    std::filesystem::weakly_canonical(std::filesystem::temp_directory_path());
+	Check(root.filename().string().starts_with("kyty_ps4_runtime_") &&
+	          std::filesystem::weakly_canonical(root).parent_path() == temporary,
+	      "cleanup stays within the generated temporary folder");
 	std::filesystem::remove_all(root);
 	return 0;
 }
