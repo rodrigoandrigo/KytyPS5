@@ -81,9 +81,9 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		D3D12_CLEAR_VALUE clear {};
 		clear.Format = texture_desc.Format;
 		std::memcpy(clear.Color, s.clear, sizeof(s.clear));
-		ComPtr<ID3D12Resource> target, readback;
+		ComPtr<ID3D12Resource> target, readback, upload;
 		CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-		                                            D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+		                                            s.initial_pixels.empty() ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST, &clear,
 		                                            IID_PPV_ARGS(&target)),
 		            "Create GCN raster target");
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
@@ -100,6 +100,17 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
 		                                            IID_PPV_ARGS(&readback)),
 		            "Create raster readback");
+		if (!s.initial_pixels.empty()) {
+			heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+			CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+			            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)), "Create initial framebuffer upload");
+			void* data; const D3D12_RANGE empty {0, 0};
+			CheckRaster(upload->Map(0, &empty, &data), "Map initial framebuffer");
+			for (uint32_t y = 0; y < s.height; ++y)
+				std::memcpy(static_cast<uint8_t*>(data) + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
+				            s.initial_pixels.data() + size_t(y) * s.width * 4, size_t(s.width) * 4);
+			upload->Unmap(0, nullptr);
+		}
 		D3D12_DESCRIPTOR_HEAP_DESC descriptors {};
 		descriptors.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 		descriptors.NumDescriptors = 1;
@@ -128,9 +139,18 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		list->RSSetViewports(1, &viewport);
 		list->RSSetScissorRects(1, &scissor);
 		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-		list->ClearRenderTargetView(rtv, s.clear, 0, nullptr);
+		if (s.initial_pixels.empty()) list->ClearRenderTargetView(rtv, s.clear, 0, nullptr);
+		else {
+			D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
+			src.pResource = upload.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint = footprint;
+			dst.pResource = target.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+			D3D12_RESOURCE_BARRIER initial_barrier {}; initial_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			initial_barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET};
+			list->ResourceBarrier(1, &initial_barrier);
+		}
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		list->DrawInstanced(3, 1, 0, 0);
+		list->DrawInstanced(s.vertex_count, 1, 0, 0);
 		D3D12_RESOURCE_BARRIER barrier {};
 		barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET,

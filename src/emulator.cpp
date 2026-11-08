@@ -163,7 +163,7 @@ static int RunPs4Cpu(const RunOptions& options, const std::filesystem::path& rel
 		rt->UnloadProgram(program);
 	}
 	rt->Clear();
-	if (!ok) std::fprintf(stderr, "PS4 CPU runtime rejected: %s\n", error.c_str());
+	if (!ok) std::fprintf(stderr, "PS4 runtime rejected: %s\n", error.c_str());
 	return ok ? 0 : 1;
 }
 

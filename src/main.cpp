@@ -57,7 +57,7 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
-	::printf("  --ps4-runtime                       Experimental PS4 CPU/HLE test profile.\n");
+	::printf("  --ps4-runtime                       Experimental PS4 CPU/HLE + bounded GNM profile.\n");
 	::printf("  --platform <auto|ps4|ps5>            Guest platform (diagnostic override). "
 	         "Default: auto.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");

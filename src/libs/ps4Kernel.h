@@ -15,6 +15,9 @@ struct RuntimeStats {
 	uint64_t threads_started = 0;
 	uint64_t threads_joined  = 0;
 	uint64_t tls_queries     = 0;
+	uint64_t gnm_submissions = 0;
+	uint64_t gnm_draws       = 0;
+	uint64_t gnm_rejected    = 0;
 };
 void RegisterKernelExports(Loader::SymbolDatabase& symbols);
 class KernelSession {

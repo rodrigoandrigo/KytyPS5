@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "libs/ps4Kernel.h"
+#include "libs/ps4Gnm.h"
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include "common/platform/sysWindowsVirtual.h"
 #endif
@@ -1230,6 +1231,7 @@ Program* RuntimeLinker::LoadPs4Program(const std::filesystem::path& path, std::s
 		return nullptr;
 	}
 	Libs::Ps4::RegisterKernelExports(*m_ps4_symbols);
+	Libs::Ps4::RegisterGnmExports(*m_ps4_symbols);
 	auto module = PreparePs4Program(path, 0x400000, error);
 	if (!module || module->shared || !module->entry) {
 		if (module) error = "PS4 runtime requires a main executable, not a shared module.";

@@ -235,9 +235,9 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		}
 		VkAttachmentDescription attachment {};
 		attachment.format = VK_FORMAT_R8G8B8A8_UNORM; attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-		attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachment.loadOp = s.initial_pixels.empty() ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 		attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		attachment.initialLayout = s.initial_pixels.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 		VkAttachmentReference color {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
 		VkSubpassDescription subpass {}; subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 		subpass.colorAttachmentCount = 1; subpass.pColorAttachments = &color;
@@ -259,7 +259,7 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		texture.imageType = VK_IMAGE_TYPE_2D; texture.format = attachment.format;
 		texture.extent = {s.width, s.height, 1}; texture.mipLevels = texture.arrayLayers = 1;
 		texture.samples = VK_SAMPLE_COUNT_1_BIT;
-		texture.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		texture.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 		CheckProbe(r.CreateImage(host.device, &texture, nullptr, &r.image), "Create GCN render target");
 		VkMemoryRequirements req; r.GetImageMemoryRequirements(host.device, r.image, &req);
 		r.Allocate(req, 0, r.memories[3]);
@@ -305,6 +305,11 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		CheckProbe(r.CreateGraphicsPipelines(host.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &r.pipeline), "Create GCN raster pipeline");
 		const uint64_t bytes = uint64_t(s.width) * s.height * 4;
 		r.Buffer(2, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		if (!s.initial_pixels.empty()) {
+			r.Buffer(0, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+			void* data; CheckProbe(r.MapMemory(host.device, r.memories[0], 0, bytes, 0, &data), "Map initial framebuffer");
+			std::memcpy(data, s.initial_pixels.data(), size_t(bytes)); r.UnmapMemory(host.device, r.memories[0]);
+		}
 		VkCommandPoolCreateInfo pool {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pool.queueFamilyIndex = host.family;
 		CheckProbe(r.CreateCommandPool(host.device, &pool, nullptr, &r.pool), "Create raster pool");
 		VkCommandBufferAllocateInfo allocate {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -312,13 +317,27 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		VkCommandBuffer cmd; CheckProbe(r.AllocateCommandBuffers(host.device, &allocate, &cmd), "Allocate raster command buffer");
 		VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 		CheckProbe(r.BeginCommandBuffer(cmd, &begin), "Begin raster commands");
+		if (!s.initial_pixels.empty()) {
+			VkImageMemoryBarrier barrier {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+			barrier.image = r.image; barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			r.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+			VkBufferImageCopy copy {}; copy.imageExtent = texture.extent; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			r.CmdCopyBufferToImage(cmd, r.buffers[0], r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			r.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		}
 		VkClearValue clear {}; std::memcpy(clear.color.float32, s.clear, sizeof(s.clear));
 		VkRenderPassBeginInfo pass {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
 		pass.renderPass = r.render_pass; pass.framebuffer = r.framebuffer; pass.renderArea.extent = {s.width, s.height};
 		pass.clearValueCount = 1; pass.pClearValues = &clear;
 		r.CmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
 		r.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.pipeline);
-		r.CmdDraw(cmd, 3, 1, 0, 0);
+		r.CmdDraw(cmd, s.vertex_count, 1, 0, 0);
 		r.CmdEndRenderPass(cmd);
 		VkBufferImageCopy region {}; region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; region.imageExtent = texture.extent;
 		r.CmdCopyImageToBuffer(cmd, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.buffers[2], 1, &region);

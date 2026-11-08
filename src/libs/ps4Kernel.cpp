@@ -1,4 +1,5 @@
 #include "libs/ps4Kernel.h"
+#include "libs/ps4Gnm.h"
 
 #include "common/archive.h"
 #include "common/file.h"
@@ -39,6 +40,7 @@ struct KernelSession::State {
 	std::map<K::Pthread, ThreadRecord> threads;
 	std::set<K::PthreadMutex>          mutexes;
 	std::atomic<uint64_t> allocations {0}, reads {0}, writes {0}, started {0}, joined {0}, tls {0};
+	std::shared_ptr<GnmSession> gnm;
 };
 namespace {
 std::atomic<KernelSession::State*> active {nullptr};
@@ -328,6 +330,20 @@ std::unique_ptr<KernelSession> KernelSession::Create(Loader::Program*           
 	state->program  = program;
 	state->app0     = app0;
 	state->data     = data;
+	auto* pin_state = state.get();
+	state->gnm = GnmSession::Create({
+	    .read = [](uint64_t address, std::span<uint8_t> bytes) {
+		    if (!Accessible(reinterpret_cast<const void*>(address), bytes.size(), Mode::Read)) return false;
+		    std::memcpy(bytes.data(), reinterpret_cast<const void*>(address), bytes.size()); return true;
+	    },
+	    .write = [](uint64_t address, std::span<const uint8_t> bytes) {
+		    if (!Accessible(reinterpret_cast<void*>(address), bytes.size(), Mode::Write)) return false;
+		    std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size()); return true;
+	    },
+	    .writable = [](uint64_t address, size_t size) { return Accessible(reinterpret_cast<void*>(address), size, Mode::Write); },
+	    .hold = [pin_state]() -> std::shared_ptr<void> { return std::make_shared<Common::LockGuard>(pin_state->mutex); }
+	}, error);
+	if (!state->gnm) return nullptr;
 	State* expected = nullptr;
 	if (!active.compare_exchange_strong(expected, state.get())) {
 		error = "A PS4 kernel session is already active.";
@@ -373,12 +389,15 @@ bool KernelSession::JoinAll(std::string& error) {
 	}
 }
 RuntimeStats KernelSession::Stats() const {
+	const auto gnm = m_state->gnm->Stats();
 	return {m_state->allocations.load(), m_state->reads.load(),  m_state->writes.load(),
-	        m_state->started.load(),     m_state->joined.load(), m_state->tls.load()};
+	        m_state->started.load(),     m_state->joined.load(), m_state->tls.load(),
+	        gnm.submissions, gnm.draws, gnm.rejected};
 }
 bool KernelSession::Finish(std::string& error) {
 	if (m_state->finished) return true;
 	if (!JoinAll(error)) return false;
+	m_state->gnm->Finish();
 	bool       ok    = true;
 	const auto check = [&](int result, const char* operation) {
 		if (result) {
