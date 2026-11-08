@@ -46,9 +46,12 @@ param(
     [switch]$Keep,
     # Dependencies (see README.md): the extracted NuGet packages. The defaults are under $env:KYTY_DEPS, else under build\deps.
     [string]$WinUIRoot = '',
-    [string]$WebView2Root = ''
+    [string]$WebView2Root = '',
+    [string]$SpirvToDxilRoot = '',
+    [string]$PythonExecutable = ''
 )
 $ErrorActionPreference = 'Stop'
+if ($SpirvToDxilRoot) { $env:KYTY_SPIRV_TO_DXIL_ROOT = $SpirvToDxilRoot }
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
 $deps = if ($env:KYTY_DEPS) { $env:KYTY_DEPS } else { "$root\build\deps" }
 if (-not $BuildDir) { $BuildDir = if ($env:KYTY_UWP_BUILD) { $env:KYTY_UWP_BUILD } else { "$root\build\uwp" } }
@@ -97,8 +100,16 @@ function Invoke-Configure {
     if (-not $env:KYTY_WINPTHREAD_DLL -or -not (Test-Path $env:KYTY_WINPTHREAD_DLL)) {
         Fail '$env:KYTY_WINPTHREAD_DLL must name the UCRT build of libwinpthread-1.dll (see README.md)'
     }
-    if (-not $env:KYTY_SPIRV_TO_DXIL_ROOT -or -not (Test-Path (Join-Path $env:KYTY_SPIRV_TO_DXIL_ROOT 'include\spirv_to_dxil.h'))) {
-        Fail '$env:KYTY_SPIRV_TO_DXIL_ROOT must name a spirv_to_dxil build (include, lib, bin; see README.md)'
+    if (-not $env:KYTY_SPIRV_TO_DXIL_ROOT) {
+        Fail 'Set -SpirvToDxilRoot or $env:KYTY_SPIRV_TO_DXIL_ROOT to a built translator (include, lib, bin; see README.md)'
+    }
+    foreach ($relative in 'include/spirv_to_dxil.h', 'include/dxil_versions.h', 'lib/spirv_to_dxil.lib', 'bin/spirv_to_dxil.dll') {
+        if (-not (Test-Path -LiteralPath (Join-Path $env:KYTY_SPIRV_TO_DXIL_ROOT $relative) -PathType Leaf)) {
+            Fail "missing translator artifact: $relative in $env:KYTY_SPIRV_TO_DXIL_ROOT; Mesa sources must be built first"
+        }
+    }
+    if (-not (Select-String -LiteralPath (Join-Path $env:KYTY_SPIRV_TO_DXIL_ROOT 'include/spirv_to_dxil.h') -Pattern 'spirv_to_dxil_linked' -Quiet)) {
+        Fail 'spirv_to_dxil is missing the Kyty linked-stage API (see 3rdparty/spirv_to_dxil/README.md)'
     }
     Enter-DevShell
     # Sources of the libraries upstream fetches, when they are kept in $env:KYTY_DEPS\<name>-src instead of being downloaded.
@@ -109,6 +120,7 @@ function Invoke-Configure {
         -DCMAKE_CXX_COMPILER=clang-cl -DKYTY_BUILD_UWP=ON "-DKYTY_WINUI_ROOT=$WinUIRoot" "-DKYTY_WEBVIEW2_ROOT=$WebView2Root" `
         "-DKYTY_WINPTHREAD_DLL=$env:KYTY_WINPTHREAD_DLL" $fetched `
         "-DKYTY_SPIRV_TO_DXIL_ROOT=$env:KYTY_SPIRV_TO_DXIL_ROOT" `
+        $(if ($PythonExecutable) { "-DPython3_EXECUTABLE=$PythonExecutable" }) `
         $(if ($env:KYTY_UWP_PACKAGE_NAME) { "-DKYTY_UWP_PACKAGE_NAME=$env:KYTY_UWP_PACKAGE_NAME" }) `
         $(if ($env:KYTY_UWP_DISPLAY_NAME) { "-DKYTY_UWP_DISPLAY_NAME=$env:KYTY_UWP_DISPLAY_NAME" }) `
         $(if ($env:KYTY_UWP_PROTOCOL) { "-DKYTY_UWP_PROTOCOL=$env:KYTY_UWP_PROTOCOL" }) `

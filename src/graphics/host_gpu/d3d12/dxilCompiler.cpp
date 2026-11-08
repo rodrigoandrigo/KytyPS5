@@ -161,9 +161,15 @@ DxilCompiler::DxilCompiler(ID3D12Device* device) {
 	                                   static_cast<uint32_t>(SHADER_MODEL_6_8 - SHADER_MODEL_6_0)});
 	m_shader_model      = SHADER_MODEL_6_0 + model_minor;
 	m_validator_version = DXIL_VALIDATOR_1_0 + minor;
-	m_translator_hash   = ModuleFileHash(L"spirv_to_dxil.dll");
-	Log::WriteToConsoleAndLog(fmt::format("D3D12 shaders: shader model 6.{}, DXIL validator 1.{}, 16-bit ops {}\n",
-	                                      model_minor, minor, m_lower_16bit ? "as 32-bit" : "native"));
+#if defined(DXIL_SPIRV_HAS_COMPACT_VERTEX_RUNTIME_DATA)
+	dxil_spirv_runtime_conf runtime_conf {};
+	runtime_conf.compact_vertex_runtime_data = true;
+	EXIT_IF(spirv_to_dxil_get_vertex_runtime_size(&runtime_conf) != sizeof(VertexRuntimeData));
+#endif
+	m_translator_hash = ModuleFileHash(L"spirv_to_dxil.dll");
+	Log::WriteToConsoleAndLog(
+	    fmt::format("D3D12 shaders: shader model 6.{}, DXIL validator 1.{}, 16-bit ops {}\n",
+	                model_minor, minor, m_lower_16bit ? "as 32-bit" : "native"));
 }
 
 DxilCompiler::~DxilCompiler() {
@@ -175,11 +181,30 @@ DxilCompiler::~DxilCompiler() {
 	}
 }
 
+#if defined(DXIL_SPIRV_HAS_COMPACT_VERTEX_RUNTIME_DATA)
+static_assert(sizeof(VertexRuntimeData) == DXIL_SPIRV_COMPACT_VERTEX_RUNTIME_SIZE);
+#else
 static_assert(sizeof(VertexRuntimeData) == sizeof(dxil_spirv_vertex_runtime_data));
+#endif
+static_assert(sizeof(VertexRuntimeData) <= RuntimeDataDwords * sizeof(uint32_t));
 static_assert(offsetof(VertexRuntimeData, yz_flip_mask) ==
               offsetof(dxil_spirv_vertex_runtime_data, yz_flip_mask));
 static_assert(offsetof(VertexRuntimeData, depth_bias) ==
               offsetof(dxil_spirv_vertex_runtime_data, depth_bias));
+static_assert(offsetof(VertexRuntimeData, first_vertex) ==
+              offsetof(dxil_spirv_vertex_runtime_data, first_vertex));
+static_assert(offsetof(VertexRuntimeData, base_instance) ==
+              offsetof(dxil_spirv_vertex_runtime_data, base_instance));
+static_assert(offsetof(VertexRuntimeData, is_indexed_draw) ==
+              offsetof(dxil_spirv_vertex_runtime_data, is_indexed_draw));
+static_assert(offsetof(VertexRuntimeData, draw_id) ==
+              offsetof(dxil_spirv_vertex_runtime_data, draw_id));
+static_assert(offsetof(VertexRuntimeData, viewport_width) ==
+              offsetof(dxil_spirv_vertex_runtime_data, viewport_width));
+static_assert(offsetof(VertexRuntimeData, viewport_height) ==
+              offsetof(dxil_spirv_vertex_runtime_data, viewport_height));
+static_assert(offsetof(VertexRuntimeData, view_index) ==
+              offsetof(dxil_spirv_vertex_runtime_data, view_index));
 static_assert(ZFlipShift == DXIL_SPIRV_Z_FLIP_SHIFT);
 
 namespace {
@@ -199,6 +224,9 @@ dxil_spirv_runtime_conf RuntimeConf(uint32_t shader_model, bool lower_16bit, boo
 	conf.clip_halfz                  = clip_halfz;
 	conf.shadow_sampler_space_offset = ComparisonSamplerSpaceOffset;
 	conf.lower_16bit_ops             = lower_16bit;
+#if defined(DXIL_SPIRV_HAS_COMPACT_VERTEX_RUNTIME_DATA)
+	conf.compact_vertex_runtime_data = true;
+#endif
 	return conf;
 }
 

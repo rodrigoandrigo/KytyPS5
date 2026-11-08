@@ -5,6 +5,9 @@
 #include "graphics/host_gpu/d3d12/dxilCompiler.h"
 #include "graphics/host_gpu/d3d12/graphicContext.h"
 #include "graphics/host_gpu/d3d12/textureArrayTest.h"
+#include "graphics/host_gpu/d3d12/ps4TransferProbe.h"
+#include "graphics/host_gpu/d3d12/ps4RasterProbe.h"
+#include "graphics/shader/recompiler/GcnCompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <D3D12MemAlloc.h>
@@ -750,6 +753,34 @@ bool RunShaderSelfTest(bool debug_layer) {
 		const auto start = Clock::now();
 		DxilCompiler compiler(graphics.device);
 		Say(fmt::format("DXIL validator loaded in {:.1f} ms", milliseconds(start)));
+		{
+			namespace Gcn = ShaderRecompiler::Gcn;
+			std::string error;
+			std::vector<uint32_t> vertex, pixel;
+			bool gcn = Gcn::Compile(Gcn::TriangleVertexFixture(false), Gcn::Stage::Vertex, vertex, error) &&
+			           Gcn::Compile(Gcn::SolidPixelFixture(), Gcn::Stage::Pixel, pixel, error);
+			if (gcn) {
+				const LinkedStage stages[] {{vertex, LinkedStage::Kind::Vertex, true},
+				                            {pixel, LinkedStage::Kind::Pixel}};
+				const auto shaders = compiler.CompileLinked(stages, 0x50533447434e0001ull);
+				Ps4::RasterState state;
+				std::vector<uint8_t> image;
+				gcn = RasterizePs4Probe(graphics.device, graphics.queue, state,
+				                        shaders[0].bytecode, shaders[1].bytecode, image, error);
+				if (gcn) {
+					// A strict interior point and a point outside the actual triangle.
+					const auto at = [&](uint32_t x, uint32_t y, uint32_t c) { return image[(y * state.width + x) * 4 + c]; };
+					gcn = at(16, 8, 0) >= 63 && at(16, 8, 0) <= 65 &&
+					      at(16, 8, 1) >= 127 && at(16, 8, 1) <= 129 &&
+					      at(16, 8, 2) >= 190 && at(16, 8, 2) <= 192 &&
+					      at(60, 30, 0) == 0 && at(60, 30, 1) == 0 && at(60, 30, 2) == 0;
+					if (!gcn) error = "GCN triangle pixel mismatch";
+				}
+			}
+			Say(gcn ? "PS4 GCN -> IR -> SPIR-V -> linked DXIL triangle raster/readback passed" :
+			          "PS4 GCN raster FAILED: " + error);
+			ok = gcn && ok;
+		}
 
 		const auto root_signature = CreateRootSignature(graphics.device);
 		const Kernel kernels[] = {
@@ -792,6 +823,21 @@ bool RunShaderSelfTest(bool debug_layer) {
 		if (FAILED(graphics.device->GetDeviceRemovedReason())) {
 			break;
 		}
+	}
+	{
+		const Ps4::LinearTarget target {0x100000000, 65, 17, 512};
+		Ps4::TransferPlan plan;
+		std::string error;
+		std::vector<uint8_t> pixels;
+		bool transfers = Ps4::DecodeTransfers(Ps4::MakeTransferFixture(target), target, plan, error) &&
+		                 ProbePs4Transfers(graphics.device, graphics.queue, plan, pixels, error);
+		if (transfers && pixels != Ps4::ExpectedTransferFixture(target)) {
+			error = "RGBA8 pixel mismatch";
+			transfers = false;
+		}
+		Say(transfers ? "PS4 PM4 linear image transfer/readback passed (no GCN shaders)" :
+		                "PS4 PM4 linear image transfer/readback FAILED: " + error);
+		ok = transfers && ok;
 	}
 	graphics.Destroy();
 	Say(ok ? "passed" : "FAILED");

@@ -27,6 +27,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Explicitly selected by the validated GCN frontend; PS5 keeps its existing ABI.
+	bool                       gcn_vertex_inputs = false;
 };
 
 struct TranslateResult {

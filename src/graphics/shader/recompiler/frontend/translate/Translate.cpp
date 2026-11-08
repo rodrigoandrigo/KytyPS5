@@ -1405,6 +1405,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg),
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
+		} else if (options.stage == ShaderType::Vertex && options.gcn_vertex_inputs) {
+			// GCN VS without instance inputs/fetch: v0 is the vertex ID.
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+			                      builtin(IR::StageInputKind::VertexIndex));
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
 			// ESVertCount describes input vertices, independently of lane ordinals.

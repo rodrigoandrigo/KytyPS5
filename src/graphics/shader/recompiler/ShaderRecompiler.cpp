@@ -771,7 +771,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
-		LOGF("ShaderRecompiler %s decoded RDNA2:\n%s", stage, decoded_dump.c_str());
+		LOGF("ShaderRecompiler %s decoded instructions:\n%s", stage, decoded_dump.c_str());
 	}
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " CFG BuildGraph\n", stage,
@@ -829,6 +829,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .gcn_vertex_inputs = options.gcn_vertex_inputs,
 	};
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);

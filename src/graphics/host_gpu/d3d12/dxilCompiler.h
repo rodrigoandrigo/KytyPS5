@@ -21,7 +21,7 @@ namespace Libs::Graphics::D3D12 {
 // (one space per ShaderRecompiler::IR::NativeBinding).
 inline constexpr uint32_t PushConstantSpace = 1000;
 inline constexpr uint32_t RuntimeDataSpace  = 1001;
-// Root constants holding spirv_to_dxil's runtime data (dxil_spirv_vertex_runtime_data, 9 dwords,
+// Root constants holding spirv_to_dxil's compact vertex runtime prefix (9 dwords,
 // or dxil_spirv_compute_runtime_data, 7 dwords). Constants avoid tying a buffer's state to it.
 inline constexpr uint32_t RuntimeDataDwords = 12;
 // Added to the space of a sampler array for its comparison-sampler declaration, which a shader

@@ -1,6 +1,14 @@
 # Compatibilidade PS4 — estado e auditoria
 
-As etapas abaixo registram entregas sucessivas; o estado mais recente está na etapa 3. As limitações das etapas anteriores são históricas.
+As etapas abaixo registram entregas sucessivas; o estado mais recente inclui o incremento gráfico da etapa 4. As limitações das etapas anteriores são históricas.
+
+## Etapa 4 — transferências, shaders GCN e draw (2026-11-07, parcial)
+
+Frontend PM4 PS4 separado, plano compartilhado validado e diagnóstico de imagem com execução/transferência/readback real em D3D12 e Vulkan. Foram conferidos todos os pixels nas dimensões 64×32, 65×17 com padding e 1×1; o D3D12 também passou em WARP e com zero erros da camada de depuração. Build UWP/D3D12 e imports aprovados. Nenhuma instalação ou execução UWP/Xbox.
+
+O incremento seguinte acrescenta um frontend GCN próprio e a ABI VS `v0`, reutilizando a IR e a emissão SPIR-V apenas para o subconjunto validado. VS/PS GCN geram um triângulo real, com scissor, blend e máscara de canais, em D3D12 hardware/WARP e Vulkan. Nove readbacks aprovados, imagens iguais byte a byte e zero erros nas camadas de validação. Quatro módulos SPIR-V, três pipelines ligados DXIL e dezessete testes CTest (incluindo `shader_cfg` PS5) aprovados. Build UWP/D3D12 e imports aprovados; nenhuma instalação ou execução AppContainer/Xbox.
+
+O diagnóstico usa recursos privados, alvos e estados explícitos. Não implementa shaders arbitrários, descriptors/tiling PS4 completos nem submissão GNM a partir de jogos. O teste comprova rasterização desse subconjunto e preservação dos testes PS5; não comprova gameplay ou boot comercial. Contratos e evidências: [PS4_GPU.md](PS4_GPU.md) e [PS4_GCN_RASTER.md](PS4_GCN_RASTER.md).
 
 ## Etapa 3 — runtime PS4 de CPU/HLE (2026-11-07)
 
@@ -9,7 +17,7 @@ O perfil experimental conecta o adaptador da etapa 2 ao `RuntimeLinker`, à mem�
 ### Implementação e contratos
 
 - `src/libs/ps4Kernel.*`: registro exclusivo PS4, com 15 exports `libkernel` v1 / módulo `libkernel` v1.0. São wrappers SysV sobre os serviços existentes; nenhum catálogo PS5 é incorporado automaticamente. Import obrigatório desconhecido ou com identidade/versão diferente impede a carga, com diagnóstico do adaptador.
-- `RuntimeLinker::LoadPs4Program` / `ExecutePs4`: validação, registro, init/entry/fini, espera de workers, limpeza e unload existentes. Uma imagem principal por sessão; execução repetida do mesmo `Program` é recusada. Segmentos separados e alinhados a 16 KiB; RWX é recusado. A imagem é preenchida RW e publicada com as proteções finais; os helpers TLS são publicados executáveis separadamente.
+- `RuntimeLinker::LoadPs4Program` / `ExecutePs4`: validação, registro, init/entry/fini, espera de workers, limpeza e unload existentes. Uma imagem principal por sessão; execução repetida do mesmo `Program` é recusada. Init/fini usam a assinatura de módulo do runtime existente e exigem retorno zero neste subconjunto. Segmentos separados e alinhados a 16 KiB; RWX é recusado. A imagem é preenchida RW e publicada com as proteções finais; os helpers TLS são publicados executáveis separadamente.
 - Memória: `sceKernelMapNamedFlexibleMemory` aceita alocações RW, flags zero e endereço de entrada nulo, em múltiplos de 16 KiB; `sceKernelMunmap` exige exatamente uma alocação pertencente à sessão. Limite acumulado de 64 MiB neste perfil de teste. Não representa o orçamento de memória do PS4.
 - Arquivos: `sceKernelOpen/Close/Read/Write`, até 64 descritores; acesso de leitura em `/app0`, leitura/escrita em `/data`. Flags de acesso, criação e truncamento; outras flags retornam ENOTSUP. Diretórios retornam EISDIR. Caminhos fora dessas montagens, traversal, componentes com ponto/espaço final, caracteres/nomes de dispositivo reservados do Windows e links/reparse points observados são recusados. São verificações de compatibilidade de caminhos; código guest nativo não é isolado como processo seguro.
 - Ponteiros e handles: os wrappers verificam faixas e permissões guest antes de ler/escrever; não aceitam descritores, threads ou mutexes alheios à sessão. Ponteiro inválido retorna EFAULT; descritor inválido, EBADF; escrita em `/app0`, EROFS. Strings UTF-8 são verificadas e limitadas. I/O por chamada limitado a 64 MiB.
@@ -29,13 +37,45 @@ As identidades/NIDs e assinaturas foram conferidas no código local de `shadPS4-
 
 `tests/Ps4RuntimeTests.cpp` gera ELF e SELF descriptografado redistribuíveis, com código AMD64 próprio, imports reais do perfil e init/fini. O teste executa o guest; não substitui suas chamadas por uma sequência de operações host. Verifica permissões RX/RW, leitura de quatro bytes de `/app0/input.bin`, gravação efetiva em `/data/result.bin`, erros de ponteiro/caminho/escrita, thread bloqueada em mutex e TLS independente. Acesso TLS é exercitado tanto pelo import quanto pela leitura FS:[0] remendada pelo runtime. Confere a stack guest, init/fini, unload e rejeição de segunda execução. Uma terceira execução ELF deixa arquivo, mapa, mutex e worker para a limpeza automática.
 
-Validação de build e execução: PENDENTE_STAGE3.
+### Resultado validado
+
+**Critério de aceitação atendido no Windows desktop x64.** Oito testes aprovados em 1,38 s: `ps4_runtime`, `ps4_runtime_profile`, `ps4_module`, `guest_platform`, `guest_platform_files`, `archive_file`, `ngs2_sampler` e `launcher_guest_platform`. Log integral: `build/stage3/ctest-final.log`.
+
+```text
+PS4_RUNTIME: ELF status=0x600dcafe last_return=0x0 reads=1 writes=1 threads=1/1 TLS=3
+PS4_RUNTIME: SELF status=0x600dcafe last_return=0x0 reads=1 writes=1 threads=1/1 TLS=3
+PS4_RUNTIME: ELF-auto-cleanup status=0x600dcafe last_return=0x0 reads=1 writes=1 threads=1/1 TLS=3
+100% tests passed, 0 tests failed out of 8
+```
+
+`ps4_runtime_profile` exercita o caminho de aplicação `Emulator::Run` com detecção automática PS4 e opção CPU/HLE; não é um teste do parser de argumentos nem de uma janela. Confere a gravação real dos quatro bytes. O teste do carregador também verifica TLS com 16 bytes declarados e 32 bytes de armazenamento para o TCB, preservando o limite declarado.
+
+O alvo completo `ps4_runtime_tests` foi compilado com GCC 16.1.0/Ninja e todos os fontes do núcleo, incluindo `emulator.cpp` e o renderizador Vulkan existente. Log: `build/stage3/build11.log`. Depois dos ajustes encontrados na execução, os quatro fontes alterados (`runtimeLinker.cpp`, `ps4Kernel.cpp`, `memory.cpp` e o testador) foram recompilados com seus comandos gerados pelo CMake/Ninja e o executável foi religado; logs `build/stage3/rebuild-*.log` e helper local `rebuild_runtime.py`. Foram removidas apenas informações de debug do executável de teste durante essa ligação para reduzir o custo de carregamento; isso não altera o código guest ou os asserts. O executável normal `kyty_emulator` e a UI completa não foram reconstruídos/exercitados nesta etapa. `main.cpp` passou pela verificação de compilação sem geração de objeto (`build/stage3/main-syntax-final.log`).
+
+Para destravar esse build, foram necessárias correções de integração anteriores ao perfil PS4: tipos explícitos em 28 inicializadores/atribuições Vulkan de 13 arquivos (mesmos valores), membro inicial padrão em `Ngs2RackOptionUnion`, restauração de `max` somente nos fontes C de `cpuinfo` e dependências Windows `ws2_32`/`bcrypt` após os arquivos estáticos do FFmpeg. O teste existente `ngs2_sampler` passou. Isso verifica compilação e o teste de áudio, não regressão visual ou gameplay PS5.
+
+Os erros iniciais do teste foram corrigidos antes da aprovação: a imagem `Program` usa memória privada RW, e os helpers de backing físico não servem para copiá-la; leitura de arquivo sem renderizador precisa dispensar somente a invalidação de cache GPU, mantendo commit/pin da memória; o gerador da fixture deve emitir chamadas indiretas com o operando aceito pelo Xbyak. A fixture agora verifica o erro de geração antes de executar e compara resultados guest, efeitos em disco e contadores, evitando aceitar um simples retorno do entry point como sucesso.
+
+Comandos de reprodução em uma árvore configurada com as dependências já disponíveis:
+
+```powershell
+cmake --build build/stage1-desktop --target ps4_runtime_tests ps4_module_tests guest_platform_tests guest_platform_file_tests archive_file_tests launcher_guest_platform_tests ngs2_sampler_tests -j 6
+ctest --test-dir build/stage1-desktop -R '^(ps4_runtime|ps4_runtime_profile|ps4_module|guest_platform|guest_platform_files|archive_file|launcher_guest_platform|ngs2_sampler)$' --output-on-failure -j 1
+```
+
+O CTest define `KYTY_LAZY_MEMORY=1` para os dois testes do runtime. Para gerar uma fixture própria sem executá-la: `ps4_runtime_tests --emit-fixture <pasta>`; o programa cria `app0/eboot.bin`, `app0/sce_sys/param.sfo` e `app0/input.bin`.
 
 ### Limites
 
 O critério desta etapa é o teste básico de CPU/HLE, não boot comercial. Não há GPU PS4, imagem apresentada, áudio, input, eventos, API de save data, POSIX completo, dependências guest recursivas, TLS externo, PRX dinâmico ou LoadExec implementados neste incremento. Recursos adicionais devem ser adicionados quando houver teste que exercite seus contratos. Import ausente continua sendo bloqueio explícito; não existe stub universal de sucesso.
 
-A configuração UWP foi tentada novamente usando WinUI 2.8.7 e WebView2 1.0.2849.39 já presentes em `teste1` e winpthread UCRT existente. O preflight os aceita e para em `KYTY_SPIRV_TO_DXIL_ROOT` ausente; o CMake/build UWP não é alcançado. Log: `build/stage3/configure-uwp.log`. Não há validação AppContainer, Xbox Series X/S, GPU, gameplay ou regressão visual PS5. Nada foi instalado ou implantado.
+A tentativa inicial de configuração UWP parou por ausência de `spirv_to_dxil` (`build/stage3/configure-uwp.log`). Esse bloqueio foi resolvido compilando os fontes de `C:/Users/rodri/Dev1/Projetos/Mesa-UWP`, revisão `e1d9d2b601230c490ed803776a67199e06d87243`, em cópia separada. O checkout original permanece intacto. A distribuição está em `build/stage3/spirv_to_dxil-dist`, com revisão, hashes e ferramentas em `manifest.json`; o patch cumulativo está em `3rdparty/spirv_to_dxil/mesa-uwp-e1d9d2b601.patch`.
+
+O port mantém a API de pipeline ligado do Kyty e explicita a diferença entre os 36 bytes de dados de vértice enviados pelo backend e os 200 bytes da estrutura estendida do fork. O modo compacto verifica tamanho e offsets, mantém a alocação de root constants e rejeita acessos além do prefixo. O modo padrão do Mesa conserva os 200 bytes. Não foram implementados campos adicionais no backend por essa adaptação.
+
+Cinco objetos DXIL passaram no validador do SDK: compute, VS/PS ligados e geometria com ABI compacto/completo. O caso que requer viewport adicional é recusado no modo compacto pelo motivo esperado. Log: `build/stage3/spirv-smoke-repro.log`. O patch passa em `git apply --check` no Mesa original; a DLL passou na conferência de imports contra `WindowsApp.lib` (`build/stage3/mesa-import-audit.log`). O preflight também recusa a pasta contendo apenas fontes, antes de criar o build (`build/stage3/source-preflight.log`).
+
+A configuração e o build completo UWP/D3D12 passaram usando WinUI 2.8.7 e WebView2 1.0.2849.39 de `teste1`, winpthread UCRT existente, FFmpeg local e cópia local do ZArchive com o patch UWP já existente. Foram gerados `build/stage3-uwp/kyty_uwp.exe` e o layout local `build/stage3-uwp/uwp-layout`; os novos arquivos CPU/HLE PS4 também compilaram nesse alvo. Logs: `build/stage3/configure-uwp-mesa3.log` e `build/stage3/build-uwp-final.log`. Os imports nomeados do layout passaram na conferência contra `WindowsApp.lib` (`build/stage3/uwp-import-audit.log`); essa conferência não verifica imports por ordinal e não substitui execução no dispositivo. Não há validação AppContainer, Xbox Series X/S, GPU, gameplay ou regressão visual PS5. Nada foi instalado ou implantado.
 
 ---
 

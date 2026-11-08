@@ -87,8 +87,9 @@ Requirements:
 - Windows SDK 10.0.26100 or newer (C++/WinRT and the packaging tools) and the store C++ runtime from Visual Studio's C++ workload, with clang-cl.
 - The WinUI 2 NuGet package `Microsoft.UI.Xaml` 2.8.7 and its declared dependency `Microsoft.Web.WebView2` 1.0.2849.39, extracted (a `.nupkg` is a zip). Only WebView2's metadata is used, to generate the C++ headers; nothing of it is packaged. `$env:KYTY_DEPS` is the folder that holds `nuget\<package>` (default `build\deps`), or pass `-WinUIRoot` and `-WebView2Root`.
 - The submodules (`git submodule update --init`) and glslang's `glslangValidator` on the PATH, as for the desktop build.
-- Mesa's `spirv_to_dxil` (its `include`, `lib` and `bin`) in `$env:KYTY_SPIRV_TO_DXIL_ROOT`; `docs/d3d12-backend.md` explains how to build it. The DXIL validator (`dxil.dll`) comes from the Windows SDK.
+- Mesa's `spirv_to_dxil` (its `include`, `lib` and `bin`) through `-SpirvToDxilRoot` or `$env:KYTY_SPIRV_TO_DXIL_ROOT`; `docs/d3d12-backend.md` explains how to build it. The DXIL validator (`dxil.dll`) comes from the Windows SDK.
 - The UCRT build of `libwinpthread-1.dll` (mingw-w64, MSYS2 package `mingw-w64-ucrt-x86_64-libwinpthread`) in `$env:KYTY_WINPTHREAD_DLL`.
+- `-PythonExecutable` can name an existing host Python interpreter when CMake cannot locate one.
 - The libraries upstream fetches at configure time (opus, xbyak, zydis, zstd, ZArchive): downloaded, or taken from `$env:KYTY_DEPS\<name>-src` (opus, xbyak, zydis, zstd) and `$env:KYTY_ZARCHIVE_SOURCE` (ZArchive, with upstream's patch and `src/uwp/zarchive-open-from-stream.patch` applied) when they exist. `$env:KYTY_FFMPEG_DIR` names an unpacked FFmpeg package (upstream's prebuilt one) to use instead of downloading it.
 - Developer Mode (Settings > System > For developers) to register the unsigned package.
 

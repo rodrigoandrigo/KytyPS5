@@ -1,0 +1,178 @@
+#include "graphics/host_gpu/d3d12/ps4RasterProbe.h"
+
+#include <windows.h>
+#include <cstring>
+#include <d3d12.h>
+#include <stdexcept>
+#include <wrl/client.h>
+
+namespace Libs::Graphics::D3D12 {
+namespace {
+using Microsoft::WRL::ComPtr;
+void CheckRaster(HRESULT hr, const char* op) {
+	if (FAILED(hr))
+		throw std::runtime_error(std::string(op) + " HRESULT=" + std::to_string(uint32_t(hr)));
+}
+} // namespace
+bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps4::RasterState& s,
+                       std::span<const uint8_t> vertex, std::span<const uint8_t> pixel,
+                       std::vector<uint8_t>& image, std::string& error) {
+	if (!Ps4::ValidateRasterState(s, error)) return false;
+	if (!device || !queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+	    vertex.empty() || pixel.empty()) {
+		error = "Invalid PS4 raster device/queue/shaders";
+		return false;
+	}
+	try {
+		D3D12_ROOT_PARAMETER parameter {};
+		parameter.ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		parameter.Constants.Num32BitValues = 12;
+		parameter.Constants.RegisterSpace  = 1001;
+		D3D12_ROOT_SIGNATURE_DESC root_desc {};
+		root_desc.NumParameters = 1;
+		root_desc.pParameters   = &parameter;
+		root_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+		ComPtr<ID3DBlob> blob, errors;
+		CheckRaster(
+		    D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors),
+		    "Serialize raster root");
+		ComPtr<ID3D12RootSignature> root;
+		CheckRaster(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+		                                        IID_PPV_ARGS(&root)),
+		            "Create raster root");
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline {};
+		pipeline.pRootSignature                   = root.Get();
+		pipeline.VS                               = {vertex.data(), vertex.size()};
+		pipeline.PS                               = {pixel.data(), pixel.size()};
+		pipeline.SampleMask                       = UINT_MAX;
+		pipeline.RasterizerState.FillMode         = D3D12_FILL_MODE_SOLID;
+		pipeline.RasterizerState.CullMode         = D3D12_CULL_MODE_NONE;
+		pipeline.RasterizerState.DepthClipEnable  = TRUE;
+		pipeline.DepthStencilState.DepthEnable    = FALSE;
+		pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+		pipeline.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_ALWAYS;
+		pipeline.DepthStencilState.StencilEnable  = FALSE;
+		auto& blend                               = pipeline.BlendState.RenderTarget[0];
+		blend.BlendEnable                         = s.alpha_blend;
+		blend.SrcBlend  = s.alpha_blend ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ONE;
+		blend.DestBlend = s.alpha_blend ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ZERO;
+		blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		blend.SrcBlendAlpha                = D3D12_BLEND_ONE;
+		blend.DestBlendAlpha        = s.alpha_blend ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ZERO;
+		blend.LogicOp               = D3D12_LOGIC_OP_NOOP;
+		blend.RenderTargetWriteMask = s.write_mask;
+		pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		pipeline.NumRenderTargets      = 1;
+		pipeline.RTVFormats[0]         = DXGI_FORMAT_R8G8B8A8_UNORM;
+		pipeline.SampleDesc.Count      = 1;
+		ComPtr<ID3D12PipelineState> pso;
+		CheckRaster(device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&pso)),
+		            "Create GCN raster PSO");
+		D3D12_HEAP_PROPERTIES heap {};
+		heap.Type             = D3D12_HEAP_TYPE_DEFAULT;
+		heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+		D3D12_RESOURCE_DESC texture_desc {};
+		texture_desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		texture_desc.Width            = s.width;
+		texture_desc.Height           = s.height;
+		texture_desc.DepthOrArraySize = texture_desc.MipLevels = texture_desc.SampleDesc.Count = 1;
+		texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		texture_desc.Flags  = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		D3D12_CLEAR_VALUE clear {};
+		clear.Format = texture_desc.Format;
+		std::memcpy(clear.Color, s.clear, sizeof(s.clear));
+		ComPtr<ID3D12Resource> target, readback;
+		CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+		                                            D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+		                                            IID_PPV_ARGS(&target)),
+		            "Create GCN raster target");
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+		UINT64                             bytes = 0;
+		device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+		D3D12_RESOURCE_DESC buffer_desc {};
+		buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		buffer_desc.Width     = bytes;
+		buffer_desc.Height = buffer_desc.DepthOrArraySize = buffer_desc.MipLevels =
+		    buffer_desc.SampleDesc.Count                  = 1;
+		buffer_desc.Layout                                = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		heap.Type                                         = D3D12_HEAP_TYPE_READBACK;
+		CheckRaster(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+		                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+		                                            IID_PPV_ARGS(&readback)),
+		            "Create raster readback");
+		D3D12_DESCRIPTOR_HEAP_DESC descriptors {};
+		descriptors.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		descriptors.NumDescriptors = 1;
+		ComPtr<ID3D12DescriptorHeap> rtv_heap;
+		CheckRaster(device->CreateDescriptorHeap(&descriptors, IID_PPV_ARGS(&rtv_heap)),
+		            "Create raster RTV heap");
+		const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+		device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+		ComPtr<ID3D12CommandAllocator>    allocator;
+		ComPtr<ID3D12GraphicsCommandList> list;
+		ComPtr<ID3D12Fence>               fence;
+		CheckRaster(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+		                                           IID_PPV_ARGS(&allocator)),
+		            "Create raster allocator");
+		CheckRaster(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
+		                                      pso.Get(), IID_PPV_ARGS(&list)),
+		            "Create raster list");
+		CheckRaster(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
+		            "Create raster fence");
+		list->SetGraphicsRootSignature(root.Get());
+		uint32_t runtime[12] {};
+		runtime[3] = 1; // Y flip, matching Vulkan's positive-height viewport.
+		list->SetGraphicsRoot32BitConstants(0, 12, runtime, 0);
+		const D3D12_VIEWPORT viewport {0, 0, float(s.width), float(s.height), 0, 1};
+		const D3D12_RECT     scissor {LONG(s.left), LONG(s.top), LONG(s.right), LONG(s.bottom)};
+		list->RSSetViewports(1, &viewport);
+		list->RSSetScissorRects(1, &scissor);
+		list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		list->ClearRenderTargetView(rtv, s.clear, 0, nullptr);
+		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		list->DrawInstanced(3, 1, 0, 0);
+		D3D12_RESOURCE_BARRIER barrier {};
+		barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                      D3D12_RESOURCE_STATE_COPY_SOURCE};
+		list->ResourceBarrier(1, &barrier);
+		D3D12_TEXTURE_COPY_LOCATION source {}, dest {};
+		source.pResource     = target.Get();
+		source.Type          = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dest.pResource       = readback.Get();
+		dest.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		dest.PlacedFootprint = footprint;
+		list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+		CheckRaster(list->Close(), "Close raster list");
+		ID3D12CommandList* lists[] {list.Get()};
+		queue->ExecuteCommandLists(1, lists);
+		HRESULT signal;
+		while (FAILED(signal = queue->Signal(fence.Get(), 1)) &&
+		       SUCCEEDED(device->GetDeviceRemovedReason())) {
+			// Retain the submitted resources if a healthy queue cannot signal yet.
+			SleepEx(1, FALSE);
+		}
+		CheckRaster(signal, "Signal raster fence");
+		while (fence->GetCompletedValue() < 1) {
+			CheckRaster(device->GetDeviceRemovedReason(), "Raster device status");
+			SleepEx(1, FALSE);
+		}
+		CheckRaster(device->GetDeviceRemovedReason(), "Raster completed device status");
+		void*             mapped = nullptr;
+		const D3D12_RANGE range {0, SIZE_T(bytes)}, no_write {0, 0};
+		CheckRaster(readback->Map(0, &range, &mapped), "Map raster readback");
+		std::vector<uint8_t> pixels(size_t(s.width) * s.height * 4);
+		for (uint32_t y = 0; y < s.height; ++y)
+			std::memcpy(pixels.data() + size_t(y) * s.width * 4,
+			            static_cast<uint8_t*>(mapped) + footprint.Offset +
+			                size_t(y) * footprint.Footprint.RowPitch,
+			            size_t(s.width) * 4);
+		readback->Unmap(0, &no_write);
+		image = std::move(pixels);
+		return true;
+	} catch (const std::exception& e) {
+		error = e.what();
+		return false;
+	}
+}
+} // namespace Libs::Graphics::D3D12

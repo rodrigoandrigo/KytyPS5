@@ -514,6 +514,7 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/HostShaderFeatures.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -532,6 +533,77 @@ target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(ps4_runtime_tests "${KYTY_TESTS_DIR}/Ps4RuntimeTests.cpp")
+add_kyty_full_emulator_test(ps4_gcn_shader_tests "${KYTY_TESTS_DIR}/Ps4GcnShaderTests.cpp")
+if(WIN32)
+	target_link_libraries(ps4_gcn_shader_tests onecore)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME ps4_gcn_shader COMMAND ps4_gcn_shader_tests "${CMAKE_CURRENT_BINARY_DIR}/ps4-gcn-fixture")
+	set_tests_properties(ps4_gcn_shader PROPERTIES ENVIRONMENT "KYTY_LAZY_MEMORY=1" TIMEOUT 60
+		FIXTURES_SETUP ps4_gcn_spirv)
+endif()
+add_executable(ps4_transfer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Ps4TransferTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/ps4Transfer.cpp")
+target_include_directories(ps4_transfer_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(BUILD_TESTING)
+	add_test(NAME ps4_transfer COMMAND ps4_transfer_tests)
+endif()
+if(WIN32 AND NOT KYTY_BUILD_UWP)
+	add_executable(ps4_transfer_d3d12_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/Ps4TransferTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/ps4Transfer.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/d3d12/ps4TransferProbe.cpp")
+	target_include_directories(ps4_transfer_d3d12_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	target_compile_definitions(ps4_transfer_d3d12_tests PRIVATE PS4_PROBE_D3D12 NOMINMAX)
+	target_link_libraries(ps4_transfer_d3d12_tests PRIVATE d3d12 dxgi dxguid)
+	add_executable(ps4_raster_d3d12_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/Ps4RasterTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/d3d12/ps4RasterProbe.cpp")
+	target_include_directories(ps4_raster_d3d12_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	target_compile_definitions(ps4_raster_d3d12_tests PRIVATE PS4_RASTER_D3D12 NOMINMAX)
+	target_link_libraries(ps4_raster_d3d12_tests PRIVATE d3d12 dxgi dxguid)
+	if(BUILD_TESTING)
+		add_test(NAME ps4_transfer_d3d12 COMMAND ps4_transfer_d3d12_tests)
+		set_tests_properties(ps4_transfer_d3d12 PROPERTIES LABELS GPU TIMEOUT 60)
+	endif()
+endif()
+if(NOT KYTY_BUILD_UWP AND KYTY_GPU_BACKEND STREQUAL "Vulkan")
+	find_package(Vulkan QUIET)
+	if(TARGET Vulkan::Vulkan)
+		add_executable(ps4_transfer_vulkan_tests EXCLUDE_FROM_ALL
+			"${KYTY_TESTS_DIR}/Ps4TransferTests.cpp"
+			"${KYTY_SOURCE_DIR}/graphics/guest_gpu/ps4Transfer.cpp"
+			"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/ps4TransferProbe.cpp")
+		target_include_directories(ps4_transfer_vulkan_tests PRIVATE "${KYTY_SOURCE_DIR}")
+		target_compile_definitions(ps4_transfer_vulkan_tests PRIVATE PS4_PROBE_VULKAN)
+		target_link_libraries(ps4_transfer_vulkan_tests PRIVATE Vulkan::Vulkan)
+		add_executable(ps4_raster_vulkan_tests EXCLUDE_FROM_ALL
+			"${KYTY_TESTS_DIR}/Ps4RasterTests.cpp"
+			"${KYTY_SOURCE_DIR}/graphics/guest_gpu/ps4Transfer.cpp"
+			"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/ps4TransferProbe.cpp")
+		target_include_directories(ps4_raster_vulkan_tests PRIVATE "${KYTY_SOURCE_DIR}")
+		target_link_libraries(ps4_raster_vulkan_tests PRIVATE Vulkan::Vulkan)
+		if(BUILD_TESTING)
+			add_test(NAME ps4_transfer_vulkan COMMAND ps4_transfer_vulkan_tests)
+			set_tests_properties(ps4_transfer_vulkan PROPERTIES LABELS GPU TIMEOUT 60)
+			add_test(NAME ps4_gcn_raster_vulkan COMMAND ps4_raster_vulkan_tests
+				"${CMAKE_CURRENT_BINARY_DIR}/ps4-gcn-fixture")
+			set_tests_properties(ps4_gcn_raster_vulkan PROPERTIES LABELS GPU TIMEOUT 60
+				FIXTURES_REQUIRED ps4_gcn_spirv)
+		endif()
+	endif()
+endif()
+# Keep diagnostic exception handling local; the rest of the emulator retains its flags.
+if(NOT MSVC AND NOT KYTY_CLANG_CL)
+	set_source_files_properties(
+		"${KYTY_TESTS_DIR}/Ps4TransferTests.cpp"
+		"${KYTY_TESTS_DIR}/Ps4RasterTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/ps4TransferProbe.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/d3d12/ps4TransferProbe.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/d3d12/ps4RasterProbe.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+endif()
 if(WIN32)
 	target_link_libraries(ps4_runtime_tests onecore)
 endif()
@@ -638,6 +710,7 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/HostShaderFeatures.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"

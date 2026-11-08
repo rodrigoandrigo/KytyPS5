@@ -112,9 +112,11 @@ Perfil CPU/HLE PS4 conectado ao `RuntimeLinker`, memória, filesystem e pthreads
 
 A fixture própria ELF/SELF chama os exports em código AMD64 e exercita memória RW, leitura de `/app0`, gravação em `/data`, mutex, thread, TLS por thread, init/fini e unload. Há um caso que deixa recursos para a limpeza automática, além de rejeições de imports ausentes e RWX. Ponteiros/handles e caminhos são verificados; operações fora do subconjunto produzem erro.
 
-**Validação:** PENDENTE_STAGE3.
+**Validação:** critério de aceitação atendido no Windows desktop x64. Oito testes aprovados (incluindo runtime PS4, caminho `Emulator::Run`, carregador, detecção, arquivos, biblioteca e sampler de áudio). ELF, SELF e limpeza automática completaram com `status=0x600dcafe`, uma leitura, uma escrita, uma thread iniciada/unida e três consultas TLS por execução. Log: `build/stage3/ctest-final.log`. Foram corrigidos também os bloqueios de integração do build necessários para compilar o teste completo. O executável normal/UI e gameplay PS5 não foram exercitados; a confirmação é do perfil CPU/HLE descrito nesta etapa.
 
-**Limites:** isso não habilita boot comercial ou GPU PS4. Eventos, saves por título, PRX/dependências dinâmicas, TLS externo, input/áudio e LoadExec continuam pendentes de testes concretos. O perfil tem limites deliberados e usa `_Ps4Data/diagnostic`; não é contrato completo do sistema PS4. A verificação UWP aceita WinUI/WebView2 existentes em `teste1`, mas ainda para no preflight por falta de `spirv_to_dxil`. Nenhuma instalação/deploy ou execução Xbox foi realizada. Contratos e evidências em [docs/PS4_COMPATIBILITY.md](docs/PS4_COMPATIBILITY.md).
+**Integração UWP:** `spirv_to_dxil` foi compilado a partir de `C:/Users/rodri/Dev1/Projetos/Mesa-UWP`, em cópia separada com as extensões do Kyty. Distribuição: `build/stage3/spirv_to_dxil-dist`; origem e hashes em `manifest.json`. Cinco shaders DXIL passaram no validador do SDK, incluindo geometria; acessos além dos 36 bytes enviados pelo backend são recusados no modo compacto. A configuração e o build completo UWP/D3D12 passaram com WinUI/WebView2 existentes em `teste1`. Log: `build/stage3/build-uwp-final.log`. Isso inclui a compilação do perfil CPU/HLE PS4, sem execução dele em UWP.
+
+**Limites:** isso não habilita boot comercial ou GPU PS4. Eventos, saves por título, PRX/dependências dinâmicas, TLS externo, input/áudio e LoadExec continuam pendentes de testes concretos. O perfil tem limites deliberados e usa `_Ps4Data/diagnostic`; não é contrato completo do sistema PS4. Nenhuma instalação/deploy ou execução AppContainer/Xbox foi realizada. Contratos e evidências em [docs/PS4_COMPATIBILITY.md](docs/PS4_COMPATIBILITY.md).
 
 
 ## Etapa 4 — GPU PS4 e renderização
@@ -128,6 +130,16 @@ A fixture própria ELF/SELF chama os exports em código AMD64 e exercita memóri
 * Registrar limitações gráficas conhecidas, inclusive comandos não implementados ou recursos indisponíveis no Xbox.
 
 **Critério de aceitação:** teste gráfico PS4 reproduz um resultado verificável, sem comprometer testes do renderizador PS5; o caminho UWP/D3D12 compila e é exercitado quando o hardware estiver disponível.
+
+### Incremento da etapa 4 — 2026-11-07
+
+Implementado um frontend PS4 separado para transferências PM4: NOP opaco, `DMA_DATA` com preenchimento imediato em memória e `WRITE_DATA` incremental. O lote é validado por inteiro antes de produzir um plano independente de backend; controles, comandos ou endereços fora do subconjunto são recusados. Nenhum shader GCN é encaminhado ao decodificador RDNA2 PS5.
+
+O diagnóstico executa as transferências em buffers privados, copia o resultado para uma imagem RGBA8 e confere todos os pixels após leitura de volta e conclusão da GPU. Passou na Radeon RX 6600M com D3D12 e Vulkan e também em D3D12 WARP: 64×32, 65×17 com padding e 1×1. O D3D12 passou com a camada de depuração e zero erros. As imagens de 64×32 dos dois backends são idênticas byte a byte. O código D3D12 integra o diagnóstico de shaders existente; o build completo UWP e a conferência de imports passaram, sem instalação.
+
+**Shaders e draw:** frontend GCN próprio ligado à IR compartilhada, com VS/PS de um subconjunto de ALU e exports, ABI VS `v0` e recusa explícita do que não é suportado. Quatro módulos SPIR-V e três pares de shaders DXIL passaram nos validadores. O diagnóstico rasteriza um triângulo real, com testes de scissor, blend e máscara de canais em D3D12 hardware/WARP e Vulkan. Os nove readbacks passaram, com imagens iguais byte a byte e zero erros nas camadas de validação. Dezessete testes CTest, incluindo a suíte PS5 `shader_cfg`, passaram; build UWP/D3D12 e imports aprovados. Evidências em [docs/PS4_GCN_RASTER.md](docs/PS4_GCN_RASTER.md).
+
+**Estado:** transferências e draw GCN diagnóstico validados; etapa 4 geral ainda parcial. Não há shaders arbitrários, descriptors/tiling PS4 completos, integração `sceGnmSubmitCommandBuffers`/video-out com o runtime PS4 ou execução Xbox. Os alvos e o estado de rasterização são fornecidos explicitamente ao diagnóstico; não representam descriptors/registradores GCN completos decodificados. A recusa de lançamento PS4 normal permanece. Nada foi instalado. Auditoria e limites em [docs/PS4_GPU.md](docs/PS4_GPU.md).
 
 ## Etapa 5 — Integração com Xbox/UWP
 
