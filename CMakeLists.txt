@@ -489,10 +489,10 @@ function(add_kyty_full_emulator_test target source)
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
-		target_link_libraries(${target} iphlpapi dxgi)
+		# Placeholder mappings use MapViewOfFile3/UnmapViewOfFile2 on both toolchains.
+		target_link_libraries(${target} iphlpapi dxgi onecore)
 	endif()
 	if (KYTY_CLANG_CL)
-		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored

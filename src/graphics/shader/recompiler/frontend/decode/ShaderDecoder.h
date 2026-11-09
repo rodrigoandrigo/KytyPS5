@@ -853,6 +853,8 @@ struct Instruction {
 	Operand        src1;
 	Operand        src2;
 	Operand        src3;
+	// GCN CMPX writes both VCC and EXEC; RDNA2 decoding leaves this false.
+	bool           gcn_cmpx_updates_vcc_exec                     = false;
 	uint32_t       src_count                                    = 0;
 	uint32_t       offset                                       = 0;
 	uint32_t       secondary_offset                             = 0;

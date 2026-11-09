@@ -16,6 +16,22 @@ struct GnmMemory {
 struct GnmStats {
 	uint64_t submissions = 0, draws = 0, rejected = 0;
 };
+// Bounded metadata only. Host completion is the renderer contract, not proof
+// of guest publication or actual writes by each shader invocation.
+struct GnmDrawEvidence {
+	uint64_t attempt = 0, ordinal = 0, target = 0, resource_bytes = 0;
+	uint32_t command_buffer = 0, command_dword = 0, vertex_words = 0, pixel_words = 0;
+	bool host_completed = false, guest_published = false, batch_rejected = false;
+	uint64_t command_address = 0;
+};
+enum class GnmSubmitPhase { Validation, Host, Publication, Completed };
+struct GnmSubmissionEvidence {
+	uint64_t attempt = 0, command_address = 0, target = 0;
+	uint32_t command_dword = 0, opcode = 0;
+	GnmSubmitPhase phase = GnmSubmitPhase::Validation;
+	bool rejected = false, success = false;
+	std::string error; // at most1024 bytes, no guest payload
+};
 class GnmSession {
 public:
 	struct State;
@@ -27,9 +43,13 @@ public:
 	int32_t SetShader(bool vertex, uint64_t commands, uint32_t size, uint64_t registers,
 	                  uint32_t modifier = 0);
 	int32_t Draw(uint64_t commands, uint32_t size, uint32_t count, uint32_t flags);
+	int32_t DrawIndexed(uint64_t commands, uint32_t size, uint32_t count, uint64_t indices,
+	                    uint32_t flags, uint32_t type);
 	int32_t Done();
 	void    Finish();
 	GnmStats    Stats() const;
+	std::vector<GnmDrawEvidence> DrawEvidence() const;
+	std::vector<GnmSubmissionEvidence> SubmissionEvidence() const;
 	std::string LastError() const;
 
 private:

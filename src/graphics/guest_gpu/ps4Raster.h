@@ -19,7 +19,9 @@ struct RasterState {
 	std::span<const uint8_t> vertex_buffer, vertex_buffer2; // VS array, binding 60.
 	Texture2D                pixel_texture, vertex_texture;
 	uint32_t                 width = 64, height = 32;
-	uint32_t                 vertex_count = 3;
+	uint32_t                 vertex_count = 3; // count of indices for indexed draws
+	std::span<const uint8_t> indices;
+	uint32_t                 index_bytes = 0; // 0=auto; 2=uint16; 4=uint32
 	uint32_t                 left = 0, top = 0, right = 64, bottom = 32;
 	float                    clear[4] {0, 0, 0, 1};
 	uint8_t                  write_mask = 15;
@@ -49,6 +51,12 @@ inline bool ValidateRasterState(const RasterState& s, std::string& error) {
 	    s.top > s.bottom || s.right > s.width || s.bottom > s.height || s.write_mask > 15 ||
 	    !s.vertex_count || s.vertex_count > 65535 || s.vertex_count % 3) {
 		error = "Unsupported PS4 diagnostic raster dimensions/scissor/write mask";
+		return false;
+	}
+	if (s.indices.empty() ? s.index_bytes != 0 :
+	    ((s.index_bytes != 2 && s.index_bytes != 4) ||
+	     s.indices.size() != size_t(s.vertex_count) * s.index_bytes)) {
+		error = "Invalid PS4 index type/snapshot/count";
 		return false;
 	}
 	for (float c: s.clear)

@@ -15,9 +15,19 @@ std::vector<uint32_t> SolidPixelFixture(float red = 0.25f, float green = 0.5f, f
 std::vector<uint32_t> UniformBranchPixelFixture();
 std::vector<uint32_t> IndexedBufferPixelFixture(bool dword = false);
 std::vector<uint32_t> FetchVertexFixture();
+std::vector<uint32_t> TypedFetchFixture();
+std::vector<uint32_t> ExternalFetchVertexFixture();
+std::vector<uint32_t> ExternalFetchFunctionFixture();
 std::vector<uint32_t> TextureVertexFixture();
 std::vector<uint32_t> TexturePixelFixture();
+std::vector<uint32_t> SampledTextureFixture(Stage stage);
+std::vector<uint32_t> TableSampledTextureFixture(Stage stage);
 std::vector<uint32_t> BufferPixelFixture(uint32_t dword_offset = 0);
 std::vector<uint32_t> InterpolatedVertexFixture(bool perspective = false);
 std::vector<uint32_t> InterpolatedPixelFixture(bool arithmetic = false);
+std::vector<uint32_t> FlatPixelFixture();
+std::vector<uint32_t> IntegerComparePixelFixture(bool unsigned_compare = false);
+std::vector<uint32_t> CmpxPixelFixture(uint32_t kind = 0);
+std::vector<uint32_t> MaskedPixelFixture(bool nested = false, bool select = false);
+std::vector<uint32_t> ElsePixelFixture(bool guarded = true, bool nested = false, uint32_t predicate = 1);
 } // namespace Libs::Graphics::ShaderRecompiler::Gcn

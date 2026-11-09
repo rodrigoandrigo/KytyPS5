@@ -43,6 +43,21 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		root_desc.NumParameters = has_resources ? 4 : 1;
 		root_desc.pParameters   = parameters;
 		root_desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+		// The strict PS4 sampler profile has no dynamic host state. Keep separate
+		// canonical registers per stage, matching GcnCompiler's SPIR-V bindings.
+		D3D12_STATIC_SAMPLER_DESC samplers[2] {};
+		for (uint32_t stage = 0; stage < 2; ++stage) {
+			auto& sampler = samplers[stage];
+			sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+			sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+			sampler.MaxAnisotropy = 1;
+			sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+			sampler.MinLOD = sampler.MaxLOD = 0;
+			sampler.ShaderRegister = 66 + stage;
+			sampler.ShaderVisibility = stage ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+		}
+		root_desc.NumStaticSamplers = 2;
+		root_desc.pStaticSamplers = samplers;
 
 		ComPtr<ID3DBlob> blob, errors;
 		CheckRaster(
@@ -334,7 +349,32 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			list->ResourceBarrier(1, &initial_barrier);
 		}
 		list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		list->DrawInstanced(s.vertex_count, 1, 0, 0);
+		ComPtr<ID3D12Resource> index_buffer;
+		if (!s.indices.empty()) {
+			D3D12_HEAP_PROPERTIES cpu_heap {};
+			cpu_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+			cpu_heap.CreationNodeMask = cpu_heap.VisibleNodeMask = 1;
+			D3D12_RESOURCE_DESC desc {};
+			desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+			desc.Width = s.indices.size();
+			desc.Height = 1;
+			desc.DepthOrArraySize = desc.MipLevels = 1;
+			desc.SampleDesc.Count = 1;
+			desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			CheckRaster(device->CreateCommittedResource(&cpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
+			                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+			                                            IID_PPV_ARGS(&index_buffer)), "Create PS4 index upload");
+			void* mapped;
+			const D3D12_RANGE no_reads {0, 0};
+			CheckRaster(index_buffer->Map(0, &no_reads, &mapped), "Map PS4 index upload");
+			std::memcpy(mapped, s.indices.data(), s.indices.size());
+			index_buffer->Unmap(0, nullptr);
+			const D3D12_INDEX_BUFFER_VIEW view {index_buffer->GetGPUVirtualAddress(), UINT(s.indices.size()),
+			    s.index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+			list->IASetIndexBuffer(&view);
+			list->DrawIndexedInstanced(s.vertex_count, 1, 0, 0, 0);
+		} else
+			list->DrawInstanced(s.vertex_count, 1, 0, 0);
 		D3D12_RESOURCE_BARRIER barrier {};
 		barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		barrier.Transition = {target.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET,

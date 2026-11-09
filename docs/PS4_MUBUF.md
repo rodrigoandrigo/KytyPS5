@@ -1,5 +1,7 @@
 # PS4 — MUBUF indexado, dois buffers e vertex fetch
 
+Continuação P3 (2026-11-08): [MTBUF, fetch externo e índices16/32](PS4_LUMEN_INTEGRATION.md) escritos e ligados ao GNM/adaptadores, **sem compilação ou testes**. O novo export sceGnmDrawIndex também permanece não validado. Resultados anteriores abaixo são históricos.
+
 Atualização 2026-11-08: [IMAGE_LOAD RGBA8 e recursos VS/PS simultâneos](PS4_TEXTURES.md) validados: até dois buffers e uma textura por estágio, ELF com seis payloads, 25/25 testes, Vulkan/D3D12/WARP e build UWP aprovados. Samplers/filtragem, demais formatos/tiling e fase 4 geral permanecem incompletos.
 
 

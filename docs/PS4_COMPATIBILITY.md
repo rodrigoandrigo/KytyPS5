@@ -1,5 +1,14 @@
 # Compatibilidade PS4 — estado e auditoria
 
+Validação atual (2026-11-08): perfis da integração Lumen passaram em10/10 testes selecionados e270 readbacks D3D12/WARP/Vulkan; [evidências e limites](PS4_LUMEN_INTEGRATION.md). Build UWP/D3D12 e auditoria de imports aprovados; sem execução Xbox. P0–P15 continua incompleto; resultados abaixo marcados como não validados são históricos.
+
+Validação liberada pelo usuário em 2026-11-08: o adiamento de testes registrado abaixo foi revogado. Reconstrução e testes dos perfis limitados concluídos; resultados novos em `PROGRESS.md` e `build/lumen-validation`. P0–P15 continua incompleto.
+
+Implementação em andamento 2026-11-08: [checkpoint Lumen](PS4_LUMEN_INTEGRATION.md) registra adaptações de SMRD/ALU, sampler e diagnóstico GNM **ainda não compiladas ou testadas**. Integração P0..P15 INCOMPLETA; testes adiados até a integração solicitada estar completa. As aprovações anteriores abaixo não validam este novo código.
+
+Auditoria documental 2026-11-08: [contribuições do Lumen para a fase 4](PS4_LUMEN_GPU_AUDIT.md) mapeia samplers/ISA, recursos/layouts, coerência/sincronização, VideoOut, testes e limites de portabilidade/licença. Nenhum código Lumen foi integrado ou executado; as capacidades PS4 do Kyty permanecem as validadas abaixo.
+
+
 Atualização 2026-11-08: [IMAGE_LOAD RGBA8 e recursos VS/PS simultâneos](PS4_TEXTURES.md) validados: até dois buffers e uma textura por estágio, ELF com seis payloads, 25/25 testes, Vulkan/D3D12/WARP e build UWP aprovados. Samplers/filtragem, demais formatos/tiling e fase 4 geral permanecem incompletos.
 
 

@@ -1,5 +1,10 @@
 # PS4 — textura 2D RGBA8 e recursos simultâneos VS/PS
 
+Implementação em andamento 2026-11-08: [checkpoint Lumen](PS4_LUMEN_INTEGRATION.md) registra adaptações de SMRD/ALU, sampler e diagnóstico GNM **ainda não compiladas ou testadas**. Integração P0..P15 INCOMPLETA; testes adiados até a integração solicitada estar completa. As aprovações anteriores abaixo não validam este novo código.
+
+Auditoria documental 2026-11-08: [contribuições do Lumen para a fase 4](PS4_LUMEN_GPU_AUDIT.md) mapeia samplers/ISA, recursos/layouts, coerência/sincronização, VideoOut, testes e limites de portabilidade/licença. Nenhum código Lumen foi integrado ou executado; as capacidades PS4 do Kyty permanecem as validadas abaixo.
+
+
 Data: 2026-11-08. **Incremento CONCLUÍDO e validado no contrato abaixo.** A fase 4 e a compatibilidade PS4 geral continuam parciais. Nada instalado ou deployado.
 
 ## Estado anterior e alteração

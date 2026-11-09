@@ -13,6 +13,8 @@ void CheckProbe(VkResult result, const char* operation) {
 }
 // clang-format off
 #define PROBE_VK_FUNCTIONS(X) \
+	X(CreateSampler) \
+	X(DestroySampler) \
 	X(CreateBuffer) \
 	X(DestroyBuffer) \
 	X(GetBufferMemoryRequirements) \
@@ -55,6 +57,8 @@ void CheckProbe(VkResult result, const char* operation) {
 	X(CmdEndRenderPass) \
 	X(CmdBindPipeline) \
 	X(CmdDraw) \
+	X(CmdDrawIndexed) \
+	X(CmdBindIndexBuffer) \
 	X(CreateDescriptorSetLayout) \
 	X(DestroyDescriptorSetLayout) \
 	X(CreateDescriptorPool) \
@@ -69,10 +73,11 @@ struct Resources {
 #define MEMBER(name) PFN_vk##name name = nullptr;
 	PROBE_VK_FUNCTIONS(MEMBER)
 #undef MEMBER
-	VkBuffer              buffers[9] {};
-	VkDeviceMemory        memories[12] {};
+	VkBuffer              buffers[10] {};
+	VkDeviceMemory        memories[13] {};
 	VkImage               image {};
 	VkImage               textures[2] {};
+	VkSampler             samplers[2] {};
 	VkImageView           texture_views[2] {};
 	VkCommandPool         pool {};
 	VkFence               fence {};
@@ -101,6 +106,8 @@ struct Resources {
 		if (layout) DestroyPipelineLayout(host.device, layout, nullptr);
 		if (descriptor_pool) DestroyDescriptorPool(host.device, descriptor_pool, nullptr);
 		if (descriptor_layout) DestroyDescriptorSetLayout(host.device, descriptor_layout, nullptr);
+		for (auto sampler: samplers)
+			if (sampler) DestroySampler(host.device, sampler, nullptr);
 		if (framebuffer) DestroyFramebuffer(host.device, framebuffer, nullptr);
 		if (view) DestroyImageView(host.device, view, nullptr);
 		if (render_pass) DestroyRenderPass(host.device, render_pass, nullptr);
@@ -131,15 +138,16 @@ struct Resources {
 		throw std::runtime_error("No compatible Vulkan probe memory type");
 	}
 	void Buffer(uint32_t index, uint64_t bytes, VkBufferUsageFlags usage,
-	            VkMemoryPropertyFlags flags) {
+	            VkMemoryPropertyFlags flags, uint32_t memory_slot = UINT32_MAX) {
+		if (memory_slot == UINT32_MAX) memory_slot = index;
 		VkBufferCreateInfo info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 		info.size  = bytes;
 		info.usage = usage;
 		CheckProbe(CreateBuffer(host.device, &info, nullptr, &buffers[index]), "CreateBuffer");
 		VkMemoryRequirements req;
 		GetBufferMemoryRequirements(host.device, buffers[index], &req);
-		Allocate(req, flags, memories[index]);
-		CheckProbe(BindBufferMemory(host.device, buffers[index], memories[index], 0),
+		Allocate(req, flags, memories[memory_slot]);
+		CheckProbe(BindBufferMemory(host.device, buffers[index], memories[memory_slot], 0),
 		           "BindBufferMemory");
 	}
 };
@@ -439,6 +447,18 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			write.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
 			write.pImageInfo      = &image_infos[stage];
 			writes.push_back(write);
+			VkSamplerCreateInfo sampler {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+			sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+			sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			sampler.addressModeU = sampler.addressModeV = sampler.addressModeW =
+			    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+			sampler.maxAnisotropy = 1;
+			sampler.minLod = sampler.maxLod = 0;
+			CheckProbe(r.CreateSampler(host.device, &sampler, nullptr, &r.samplers[stage]),
+			           "Create PS4 nearest/clamp sampler");
+			// Immutable sampler: no extra descriptor payload or dangling local array.
+			bindings.push_back({66 + stage, VK_DESCRIPTOR_TYPE_SAMPLER, 1, visibility,
+			                    &r.samplers[stage]});
 			++images_used;
 		}
 		const bool has_resources = !bindings.empty();
@@ -451,7 +471,10 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			           "Create resource layout");
 			std::vector<VkDescriptorPoolSize> sizes;
 			if (buffers_used) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffers_used});
-			if (images_used) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, images_used});
+			if (images_used) {
+				sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, images_used});
+				sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, images_used});
+			}
 			VkDescriptorPoolCreateInfo pool {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 			pool.maxSets       = 1;
 			pool.poolSizeCount = uint32_t(sizes.size());
@@ -543,6 +566,14 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			std::memcpy(data, s.initial_pixels.data(), size_t(bytes));
 			r.UnmapMemory(host.device, r.memories[0]);
 		}
+		if (!s.indices.empty()) {
+			r.Buffer(9, s.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+			         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 12);
+			void* data;
+			CheckProbe(r.MapMemory(host.device, r.memories[12], 0, s.indices.size(), 0, &data), "Map PS4 indices");
+			std::memcpy(data, s.indices.data(), s.indices.size());
+			r.UnmapMemory(host.device, r.memories[12]);
+		}
 		VkCommandPoolCreateInfo pool {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 		pool.queueFamilyIndex = host.family;
 		CheckProbe(r.CreateCommandPool(host.device, &pool, nullptr, &r.pool), "Create raster pool");
@@ -555,6 +586,16 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		           "Allocate raster command buffer");
 		VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 		CheckProbe(r.BeginCommandBuffer(cmd, &begin), "Begin raster commands");
+		if (!s.indices.empty()) {
+			VkBufferMemoryBarrier barrier {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+			barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+			barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer = r.buffers[9];
+			barrier.size = VK_WHOLE_SIZE;
+			r.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+			                     0, 0, nullptr, 1, &barrier, 0, nullptr);
+		}
 		for (uint32_t i = 0; i < 2; ++i) {
 			if (!r.textures[i]) continue;
 			VkImageMemoryBarrier barrier {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -626,7 +667,11 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			    0, uint32_t(s.vertex_buffer.size()), uint32_t(s.vertex_buffer2.size()), 0};
 			r.CmdPushConstants(cmd, r.layout, buffer_stages, 0, sizeof(data), data);
 		}
-		r.CmdDraw(cmd, s.vertex_count, 1, 0, 0);
+		if (!s.indices.empty()) {
+			r.CmdBindIndexBuffer(cmd, r.buffers[9], 0, s.index_bytes == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+			r.CmdDrawIndexed(cmd, s.vertex_count, 1, 0, 0, 0);
+		} else
+			r.CmdDraw(cmd, s.vertex_count, 1, 0, 0);
 		r.CmdEndRenderPass(cmd);
 		VkBufferImageCopy region {};
 		region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};

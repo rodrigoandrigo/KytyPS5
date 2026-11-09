@@ -1,5 +1,10 @@
 # Fase 4 PS4 — pendências, partes e dependências
 
+Implementação em andamento 2026-11-08: [checkpoint Lumen](PS4_LUMEN_INTEGRATION.md) registra adaptações de SMRD/ALU, sampler e diagnóstico GNM **ainda não compiladas ou testadas**. Integração P0..P15 INCOMPLETA; testes adiados até a integração solicitada estar completa. As aprovações anteriores abaixo não validam este novo código.
+
+Auditoria documental 2026-11-08: [contribuições do Lumen para a fase 4](PS4_LUMEN_GPU_AUDIT.md) mapeia samplers/ISA, recursos/layouts, coerência/sincronização, VideoOut, testes e limites de portabilidade/licença. Nenhum código Lumen foi integrado ou executado; as capacidades PS4 do Kyty permanecem as validadas abaixo.
+
+
 Atualização 2026-11-08: [IMAGE_LOAD RGBA8 e recursos VS/PS simultâneos](PS4_TEXTURES.md) validados: até dois buffers e uma textura por estágio, ELF com seis payloads, 25/25 testes, Vulkan/D3D12/WARP e build UWP aprovados. Samplers/filtragem, demais formatos/tiling e fase 4 geral permanecem incompletos.
 
 
@@ -117,6 +122,8 @@ flowchart TD
 ```
 
 Avanço em P1/P6/P7: [IMAGE_LOAD e recursos simultâneos VS/PS](PS4_TEXTURES.md) fecha o contrato inicial de textura linear RGBA8, bindings e snapshots de seis recursos. As pendências gerais de samplers/formatos/tiling/coerência abaixo permanecem.
+
+Referência adicional por parte: [auditoria Lumen](PS4_LUMEN_GPU_AUDIT.md), seção 3 (P0..P15). Prioridades: sampler/IMAGE_SAMPLE_L no contrato atual; trilha de VideoOut linear para primeira apresentação; VOPC/EXEC/fetch; layouts e publicação/fences antes de caches/alias gerais. Somente documentação, sem avanço de cobertura por esta análise.
 
 ## 5. Entregas por parte
 

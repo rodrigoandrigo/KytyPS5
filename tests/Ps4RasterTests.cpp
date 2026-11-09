@@ -45,6 +45,222 @@ static void Save(const std::filesystem::path& path, const Ps4::RasterState& s,
 	Require(bool(file), "Write raster image");
 }
 template <typename Run>
+static void SampledRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 59; variant <= 64; ++variant) {
+		const bool indirect = variant >= 62;
+		const int scene = indirect ? variant - 3 : variant;
+		const bool changed = scene == 60;
+		auto payload = Ps4TextureTests::Make(0, 0, changed);
+		std::array<float, 4> vertex_mod = changed ? std::array<float, 4> {.5f, .75f, 1, 1}
+		                                             : std::array<float, 4> {.75f, .5f, .25f, 1};
+		if (scene == 61) vertex_mod = {-1, 2, 1, 1}; // UV outside [0,1], clamp at both edges
+		const std::array<float, 4> pixel_mod = changed ? std::array<float, 4> {.75f, .5f, .25f, 1}
+		                                                  : std::array<float, 4> {1, .75f, .5f, 1};
+		const std::array<float, 4> vertex_second {.5f, 1, 1, 1};
+		const std::array<float, 4> pixel_second {.5f, 1, .75f, 1};
+		Ps4::RasterState state;
+		if (indirect) {
+			state.vertex_buffer2 = Ps4TextureTests::Bytes(vertex_second);
+			state.pixel_buffer2 = Ps4TextureTests::Bytes(pixel_second);
+		}
+		state.vertex_buffer = Ps4TextureTests::Bytes(vertex_mod);
+		state.pixel_buffer = Ps4TextureTests::Bytes(pixel_mod);
+		state.vertex_texture = {8, 4, 256, payload.vs_image};
+		state.pixel_texture = {8, 4, 256, payload.ps_image};
+		std::string error;
+		std::vector<uint8_t> pixels;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "sampled raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				const float weights[] {1 - u - v, u, v};
+				const size_t vertex_texels[] {0, 7 * 4, 3 * 256};
+				float uv[2] {};
+				for (uint32_t c = 0; c < 2; ++c)
+					for (uint32_t n = 0; n < 3; ++n)
+						uv[c] += weights[n] * payload.vs_image[vertex_texels[n] + c] / 255.f * vertex_mod[c] *
+						         (indirect ? vertex_second[c] : 1.f);
+				const auto col = uint32_t(std::clamp(std::floor(uv[0] * 8), 0.f, 7.f));
+				const auto row = uint32_t(std::clamp(std::floor(uv[1] * 4), 0.f, 3.f));
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float expected = inside ? payload.ps_image[row * 256 + col * 4 + c] * pixel_mod[c] *
+					                                   (indirect ? pixel_second[c] : 1.f)
+					                              : (c == 3 ? 255.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "VS+PS IMAGE_SAMPLE_L nearest/clamp/pitch/update readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-sample-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s sample variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
+static void ParameterRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 65; variant <= 69; ++variant) {
+		Ps4::RasterState state;
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "PARAM raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				for (uint32_t c = 0; c < 4; ++c) {
+					float expected = c == 3 ? 255.f : 0.f;
+					if (inside && variant == 65) expected = c == 3 ? 255.f : c == 2 ? 63.75f : 0.f;
+					if (inside && variant >= 66) {
+						const uint32_t selector = uint32_t(variant - 66);
+						expected = (c == 3 ? (selector & 1) : (selector & 2)) ? 255.f : 0.f;
+					}
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "flat first provoking vertex/default PARAM readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-param-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s PARAM variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
+static void ExternalFetchRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 70; variant <= 73; ++variant) {
+		const bool indexed = variant >= 72;
+		const bool changed = variant == 71 || variant == 73;
+		auto data = Ps4TextureTests::Make(0, 0, changed);
+		if (indexed) {
+			data.positions[12] = data.positions[13] = changed ? .5f : .75f;
+		}
+		const std::array<uint16_t, 3> indices16 {1, 3, 2};
+		const std::array<uint32_t, 3> indices32 {1, 3, 2};
+		Ps4::RasterState state;
+		if (indexed) {
+			state.index_bytes = variant == 72 ? 2 : 4;
+			state.indices = variant == 72 ? Ps4TextureTests::Bytes(indices16) : Ps4TextureTests::Bytes(indices32);
+		}
+		state.vertex_buffer = Ps4TextureTests::Bytes(data.positions);
+		state.vertex_buffer2 = Ps4TextureTests::Bytes(data.colors);
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "external fetch raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - (changed ? 16 : 8)) / (changed ? 32 : 48);
+				const float v = (float(y) + .5f - (changed ? 8 : 4)) / (changed ? 16 : 24);
+				const bool inside = u >= 0 && v >= 0 && u <= 1 && v <= 1 &&
+				                    (indexed ? u + v > 1 : u + v < 1);
+				const float weights[] {indexed ? 1 - v : 1 - u - v,
+				                       indexed ? u + v - 1 : u, indexed ? 1 - u : v};
+				for (uint32_t c = 0; c < 4; ++c) {
+					float expected = c == 3 ? 255.f : 0.f;
+					if (inside) {
+						expected = 0;
+						for (uint32_t n = 0; n < 3; ++n) expected += weights[n] * data.colors[(indexed ? indices32[n] : n) * 4 + c] * 255;
+					}
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "external MTBUF fetch position/color update readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-external-fetch-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s external fetch variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
+static void MaskRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 74; variant <= 76; ++variant) {
+		Ps4::RasterState state;
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "masked raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				const bool replaced = u < .5f && (variant != 75 || v < .5f);
+				const float shade[] {replaced ? .75f : u, v, .25f, 1};
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "VCC/EXEC inactive lane preservation/nesting/select readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-mask-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s lane mask variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
+static void ElseRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 77; variant <= 81; ++variant) {
+		Ps4::RasterState state;
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "else raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				float red = u < .5f ? .75f : .125f;
+				if (variant == 79) red = .125f; // then empty
+				if (variant == 80) red = .75f; // else empty
+				if (variant == 81) red = u < .5f ? (v < .5f ? .75f : .125f) : .375f;
+				const float shade[] {red, v, .25f, 1};
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "EXEC else/guard/empty/nested reconvergence readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-else-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s else variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
+static void IntegerCmpxRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 82; variant <= 88; ++variant) {
+		const uint32_t mode = uint32_t(variant - 82);
+		Ps4::RasterState state;
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "integer CMPX raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				const uint32_t raw = (inside ? uint32_t(std::floor(u * 8)) : 0u) << 29;
+				const int64_t signed_value = raw & 0x80000000u ? int64_t(raw) - 0x100000000ll : int64_t(raw);
+				const bool signed_predicate = signed_value < 0x40000000ll;
+				const bool unsigned_predicate = raw < 0x40000000u;
+				bool active = mode == 1 ? unsigned_predicate : signed_predicate;
+				if (mode >= 2) {
+					const uint32_t kind = mode - 2;
+					const bool predicate = kind == 1 ? false : kind == 2 ? true :
+					    kind == 3 ? signed_predicate : kind == 4 ? unsigned_predicate : v < .5f;
+					active = u < .75f && predicate;
+				}
+				const float shade[] {active ? .75f : .125f, v,
+				    mode < 2 ? .25f : active ? .875f : .5f, 1};
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "I32/U32 signedness or CMPX VCC+EXEC/inactive-lane readback");
+				}
+			}
+		Save(folder / (std::string(backend) + "-icmp-" + std::to_string(variant) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s integer/CMPX variant=%d all=2048 PASS\n", backend, variant);
+	}
+}
+
+template <typename Run>
 static void RasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
 	for (int variant = 0; variant < 59; ++variant) {
 		Ps4::RasterState state;
@@ -253,6 +469,12 @@ static void RasterTests(Run run, const std::filesystem::path& folder, const char
 		        "Invalid raster state accepted/modified output");
 	}
 	// The same staging executor as GNM, with real GPU blending between writes.
+	SampledRasterTests(run, folder, backend);
+	ParameterRasterTests(run, folder, backend);
+	ExternalFetchRasterTests(run, folder, backend);
+	MaskRasterTests(run, folder, backend);
+	ElseRasterTests(run, folder, backend);
+	IntegerCmpxRasterTests(run, folder, backend);
 	Ps4::RasterState state;
 	state.alpha_blend = true;
 	const Ps4::LinearTarget target {0x8000, state.width, state.height, state.width * 4};
@@ -348,7 +570,12 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint8_t>(
-				        folder / (variant >= 23                    ? "gcn-texture.vert.dxil"
+				        folder / (variant >= 74                    ? "gcn-interp.vert.dxil"
+				                  : variant >= 70                    ? "gcn-external-fetch.vert.dxil"
+				                  : variant >= 65                    ? "gcn-interp.vert.dxil"
+				                  : variant >= 62                    ? "gcn-table-sample.vert.dxil"
+				                  : variant >= 59                    ? "gcn-sample.vert.dxil"
+				                  : variant >= 23                    ? "gcn-texture.vert.dxil"
 				                  : variant == 20 || variant == 21 ? "gcn-fetch.vert.dxil"
 				                  : variant >= 15                  ? "gcn-small.vert.dxil"
 				                  : variant == 14                  ? "gcn-perspective.vert.dxil"
@@ -360,7 +587,30 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.dxil"
 				                                                   : "gcn-small.vert.dxil"));
 				    const auto ps = Read<uint8_t>(
-				        folder / (variant >= 23                    ? "gcn-texture.frag.dxil"
+				        folder / (variant == 82                    ? "gcn-icmp0.frag.dxil"
+				                  : variant == 83                    ? "gcn-icmp1.frag.dxil"
+				                  : variant == 84                    ? "gcn-icmp2.frag.dxil"
+				                  : variant == 85                    ? "gcn-icmp3.frag.dxil"
+				                  : variant == 86                    ? "gcn-icmp4.frag.dxil"
+				                  : variant == 87                    ? "gcn-icmp5.frag.dxil"
+				                  : variant == 88                    ? "gcn-icmp6.frag.dxil"
+				                  : variant == 77                    ? "gcn-else0.frag.dxil"
+				                  : variant == 78                    ? "gcn-else1.frag.dxil"
+				                  : variant == 79                    ? "gcn-else2.frag.dxil"
+				                  : variant == 80                    ? "gcn-else3.frag.dxil"
+				                  : variant == 81                    ? "gcn-else4.frag.dxil"
+				                  : variant == 74                    ? "gcn-mask.frag.dxil"
+				                  : variant == 75                    ? "gcn-mask-nested.frag.dxil"
+				                  : variant == 76                    ? "gcn-select.frag.dxil"
+				                  : variant >= 70                    ? "gcn-interp.frag.dxil"
+				                  : variant == 65                    ? "gcn-flat.frag.dxil"
+				                  : variant == 66                    ? "gcn-default0.frag.dxil"
+				                  : variant == 67                    ? "gcn-default1.frag.dxil"
+				                  : variant == 68                    ? "gcn-default2.frag.dxil"
+				                  : variant == 69                    ? "gcn-default3.frag.dxil"
+				                  : variant >= 62                    ? "gcn-table-sample.frag.dxil"
+				                  : variant >= 59                    ? "gcn-sample.frag.dxil"
+				                  : variant >= 23                    ? "gcn-texture.frag.dxil"
 				                  : variant == 20 || variant == 21 ? "gcn-interp.frag.dxil"
 				                  : variant == 22                  ? "gcn-indexed-dword.frag.dxil"
 				                  : variant >= 15                  ? "gcn-indexed.frag.dxil"
@@ -468,7 +718,12 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint32_t>(
-				        folder / (variant >= 23                    ? "gcn-texture.vert.spv"
+				        folder / (variant >= 74                    ? "gcn-interp.vert.spv"
+				                  : variant >= 70                    ? "gcn-external-fetch.vert.spv"
+				                  : variant >= 65                    ? "gcn-interp.vert.spv"
+				                  : variant >= 62                    ? "gcn-table-sample.vert.spv"
+				                  : variant >= 59                    ? "gcn-sample.vert.spv"
+				                  : variant >= 23                    ? "gcn-texture.vert.spv"
 				                  : variant == 20 || variant == 21 ? "gcn-fetch.vert.spv"
 				                  : variant >= 15                  ? "gcn-small.vert.spv"
 				                  : variant == 14                  ? "gcn-perspective.vert.spv"
@@ -480,7 +735,30 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.spv"
 				                                                   : "gcn-small.vert.spv"));
 				    const auto ps = Read<uint32_t>(
-				        folder / (variant >= 23                    ? "gcn-texture.frag.spv"
+				        folder / (variant == 82                    ? "gcn-icmp0.frag.spv"
+				                  : variant == 83                    ? "gcn-icmp1.frag.spv"
+				                  : variant == 84                    ? "gcn-icmp2.frag.spv"
+				                  : variant == 85                    ? "gcn-icmp3.frag.spv"
+				                  : variant == 86                    ? "gcn-icmp4.frag.spv"
+				                  : variant == 87                    ? "gcn-icmp5.frag.spv"
+				                  : variant == 88                    ? "gcn-icmp6.frag.spv"
+				                  : variant == 77                    ? "gcn-else0.frag.spv"
+				                  : variant == 78                    ? "gcn-else1.frag.spv"
+				                  : variant == 79                    ? "gcn-else2.frag.spv"
+				                  : variant == 80                    ? "gcn-else3.frag.spv"
+				                  : variant == 81                    ? "gcn-else4.frag.spv"
+				                  : variant == 74                    ? "gcn-mask.frag.spv"
+				                  : variant == 75                    ? "gcn-mask-nested.frag.spv"
+				                  : variant == 76                    ? "gcn-select.frag.spv"
+				                  : variant >= 70                    ? "gcn-interp.frag.spv"
+				                  : variant == 65                    ? "gcn-flat.frag.spv"
+				                  : variant == 66                    ? "gcn-default0.frag.spv"
+				                  : variant == 67                    ? "gcn-default1.frag.spv"
+				                  : variant == 68                    ? "gcn-default2.frag.spv"
+				                  : variant == 69                    ? "gcn-default3.frag.spv"
+				                  : variant >= 62                    ? "gcn-table-sample.frag.spv"
+				                  : variant >= 59                    ? "gcn-sample.frag.spv"
+				                  : variant >= 23                    ? "gcn-texture.frag.spv"
 				                  : variant == 20 || variant == 21 ? "gcn-interp.frag.spv"
 				                  : variant == 22                  ? "gcn-indexed-dword.frag.spv"
 				                  : variant >= 15                  ? "gcn-indexed.frag.spv"

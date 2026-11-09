@@ -1,5 +1,18 @@
 # GCN PS4 — interpolação e cobertura por família
 
+Validação atual (2026-11-08): perfis da integração Lumen passaram em10/10 testes selecionados e270 readbacks D3D12/WARP/Vulkan; [evidências e limites](PS4_LUMEN_INTEGRATION.md). Build UWP/D3D12 e auditoria de imports aprovados; sem execução Xbox. P0–P15 continua incompleto; resultados abaixo marcados como não validados são históricos.
+
+Checkpoint atual P4: VOPC I32/U32 e CMPX F32/I32/U32 sob EXEC salvo escritos, com fixtures de signedness e atualização conjunta VCC/EXEC preparadas. **Sem compilação ou testes.** Ver [contrato e limitações](PS4_LUMEN_INTEGRATION.md). As tabelas e aprovações históricas abaixo não constituem validação desta integração.
+
+Continuação P4: else por XOR de EXEC e guard EXECZ estruturado escritos; ver [checkpoint](PS4_LUMEN_INTEGRATION.md). Ainda sem build/testes; fluxo por máscara geral continua pendente.
+
+Continuação P4 (2026-11-08): [VOPC/VCC e EXEC balanceado](PS4_LUMEN_INTEGRATION.md) escritos, ainda **sem compilação/testes**. A tabela histórica abaixo não valida o novo código; divergência GCN geral continua incompleta.
+
+Implementação em andamento 2026-11-08: [checkpoint Lumen](PS4_LUMEN_INTEGRATION.md) registra adaptações de SMRD/ALU, sampler e diagnóstico GNM **ainda não compiladas ou testadas**. Integração P0..P15 INCOMPLETA; testes adiados até a integração solicitada estar completa. As aprovações anteriores abaixo não validam este novo código.
+
+Auditoria documental 2026-11-08: [contribuições do Lumen para a fase 4](PS4_LUMEN_GPU_AUDIT.md) mapeia samplers/ISA, recursos/layouts, coerência/sincronização, VideoOut, testes e limites de portabilidade/licença. Nenhum código Lumen foi integrado ou executado; as capacidades PS4 do Kyty permanecem as validadas abaixo.
+
+
 Atualização 2026-11-08: [IMAGE_LOAD RGBA8 e recursos VS/PS simultâneos](PS4_TEXTURES.md) validados: até dois buffers e uma textura por estágio, ELF com seis payloads, 25/25 testes, Vulkan/D3D12/WARP e build UWP aprovados. Samplers/filtragem, demais formatos/tiling e fase 4 geral permanecem incompletos.
 
 

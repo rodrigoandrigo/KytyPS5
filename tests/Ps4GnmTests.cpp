@@ -83,6 +83,8 @@ struct Counts {
 	std::vector<std::vector<uint8_t>>                buffers;
 	std::vector<std::vector<uint8_t>>                buffers2;
 	std::vector<std::array<std::vector<uint8_t>, 6>> resources;
+	std::vector<std::vector<uint8_t>>                indices;
+	std::vector<uint32_t>                            index_bytes;
 	bool                                             fail = false;
 };
 class RecordingRenderer final: public Graphics::Ps4::GnmRenderer {
@@ -97,6 +99,8 @@ public:
 	            std::string& error) override {
 		Check(memory.pinned && vs.size() > 5 && ps.size() > 5, "invalid renderer call");
 		++counts->calls;
+		counts->indices.emplace_back(state.indices.begin(), state.indices.end());
+		counts->index_bytes.push_back(state.index_bytes);
 		counts->initial.push_back(state.initial_pixels[0]);
 		counts->shaders.emplace_back(ps.begin(), ps.end());
 		counts->vertex_shaders.emplace_back(vs.begin(), vs.end());
@@ -155,6 +159,20 @@ static void UnitTests() {
 	Check(counts->calls == 2 && counts->initial == std::vector<uint8_t>({10, 101}) &&
 	          memory.data[Target - Base] == 102,
 	      "ordered same-target draws preserve previous contents");
+	{
+		const auto evidence = session->DrawEvidence();
+		Check(evidence.size() == 2 && evidence[0].attempt == evidence[1].attempt &&
+		          evidence[0].ordinal < evidence[1].ordinal &&
+		          evidence[0].command_buffer == 0 && evidence[0].target == Target &&
+		          evidence[0].vertex_words && evidence[0].pixel_words &&
+		          evidence[0].host_completed && evidence[0].guest_published &&
+		          !evidence[0].batch_rejected && evidence[1].guest_published,
+		      "draw evidence separates preparation, host completion and publication");
+		const auto submits = session->SubmissionEvidence();
+		Check(submits.size() == 1 && submits[0].success && !submits[0].rejected &&
+		          submits[0].phase == Ps4::GnmSubmitPhase::Completed,
+		      "successful submission diagnostics");
+	}
 	const auto reject = [&]() {
 		const auto old    = memory.data;
 		const auto calls  = counts->calls;
@@ -170,6 +188,19 @@ static void UnitTests() {
 	memory.Put(Commands, bad);
 	memory.Put(Sizes, std::vector<uint32_t> {uint32_t(bad.size() * 4)});
 	reject();
+	{
+		const auto evidence = session->DrawEvidence();
+		Check(evidence.size() == 4 && evidence[2].batch_rejected &&
+		          evidence[3].batch_rejected && !evidence[2].host_completed &&
+		          !evidence[2].guest_published && !evidence[0].batch_rejected &&
+		          evidence[0].guest_published,
+		      "invalid tail is diagnosed without claiming GPU execution");
+		const auto submits = session->SubmissionEvidence();
+		Check(submits.back().rejected && !submits.back().success &&
+		          submits.back().phase == Ps4::GnmSubmitPhase::Validation &&
+		          submits.back().opcode == 0x99 && !submits.back().error.empty(),
+		      "submission rejection location/phase diagnostics");
+	}
 	memory.Put(Commands, commands);
 	memory.Put(Sizes, std::vector<uint32_t> {uint32_t(commands.size() * 4)});
 	memory.readonly = true;
@@ -186,6 +217,15 @@ static void UnitTests() {
 	Check(session->Submit(1, Arrays, Sizes, 0, 0) != 0 && memory.data == previous &&
 	          counts->calls == callbacks + 1,
 	      "failed renderer committed output");
+	{
+		const auto evidence = session->DrawEvidence();
+		Check(evidence.size() >= 2 && evidence.back().batch_rejected &&
+		          !evidence.back().host_completed && !evidence.back().guest_published,
+		      "host failure must not claim completion/publication");
+		Check(session->SubmissionEvidence().back().phase == Ps4::GnmSubmitPhase::Host &&
+		          session->SubmissionEvidence().back().rejected,
+		      "host failure phase diagnostics");
+	}
 	counts->fail = false;
 	std::vector<uint32_t> next;
 	Reg(next, 0x76, 0xc, {0});
@@ -202,6 +242,68 @@ static void UnitTests() {
 	Check(!session->Done(), "submit done");
 	const auto stats = session->Stats();
 	Check(stats.submissions == 2 && stats.draws == 3 && stats.rejected >= 7, "GNM counters");
+	{
+		constexpr uint64_t root = 0x418000, child = 0x420000;
+		memory.Put(child, commands);
+		const auto submit_ib = [&](const std::vector<uint32_t>& stream) {
+			memory.Put(root, stream);
+			memory.Put(Arrays, std::vector<uint64_t> {root});
+			memory.Put(Sizes, std::vector<uint32_t> {uint32_t(stream.size() * 4)});
+			return session->Submit(1, Arrays, Sizes, 0, 0);
+		};
+		const std::vector<uint32_t> ib {0xc0023f00u, uint32_t(child), 0, uint32_t(commands.size())};
+		auto calls = counts->calls;
+		Check(!submit_ib(ib) && counts->calls == calls + 2, "nested graphics IB ordered draws");
+		Check(session->DrawEvidence().back().command_address == child &&
+		          session->DrawEvidence().back().guest_published,
+		      "IB draw diagnostics must identify the nested stream");
+		auto chain = ib;
+		chain[3] |= 0x100000;
+		chain.insert(chain.end(), {0xc0009900, 0}); // unreachable tail replaced by chain
+		calls = counts->calls;
+		Check(!submit_ib(chain) && counts->calls == calls + 2, "IB chain did not replace parent tail");
+		const auto reject_ib = [&](const std::vector<uint32_t>& stream) {
+			memory.Put(root, stream);
+			memory.Put(Arrays, std::vector<uint64_t> {root});
+			memory.Put(Sizes, std::vector<uint32_t> {uint32_t(stream.size() * 4)});
+			const auto saved = memory.data;
+			const auto old_calls = counts->calls;
+			Check(session->Submit(1, Arrays, Sizes, 0, 0) != 0 && memory.data == saved &&
+			          counts->calls == old_calls && !memory.pinned,
+			      "invalid IB had host/guest effects");
+		};
+		for (auto bad: std::vector<std::vector<uint32_t>> {
+		         {0xc0023f00u, 0, 0, 4}, {0xc0023f00u, uint32_t(child) + 1, 0, 4},
+		         {0xc0023f00u, uint32_t(child), 256, 4},
+		         {0xc0023f00u, uint32_t(child), 0, 0},
+		         {0xc0023f00u, uint32_t(child), 0, 0x1000004},
+		         {0xc0023f00u, uint32_t(root), 0, 4},
+		         {0xc0023f00u, uint32_t(child), 0, 0xfffff}})
+			reject_ib(bad);
+		// A valid nested draw followed by an invalid parent packet remains
+		// metadata-only: no partial host execution before complete validation.
+		auto tail = ib;
+		tail.insert(tail.end(), {0xc0009900, 0});
+		reject_ib(tail);
+		memory.Put(Arrays, std::vector<uint64_t> {Commands});
+	}
+	// Retain only the newest 256 rows; no shader/payload bytes are retained.
+	// All submissions here use the recording renderer, not real GPU evidence.
+	memory.Put(Commands, commands);
+	memory.Put(Sizes, std::vector<uint32_t> {uint32_t(commands.size() * 4)});
+	for (uint32_t i = 0; i < 130; ++i)
+		Check(!session->Submit(1, Arrays, Sizes, 0, 0), session->LastError());
+	const auto bounded = session->DrawEvidence();
+	Check(bounded.size() == 256 && bounded.front().ordinal > 1 &&
+	          bounded.back().ordinal - bounded.front().ordinal == 255 &&
+	          bounded.back().guest_published && !bounded.back().batch_rejected,
+	      "bounded draw evidence retirement/order");
+	Check(session->SubmissionEvidence().size() <= 256 &&
+	          session->SubmissionEvidence().back().success,
+	      "bounded submission diagnostics");
+	Check(session->Draw(Commands, 7, 3, 1) != 0 &&
+	          !session->DrawEvidence().back().batch_rejected,
+	      "builder failure must not relabel a committed submit");
 	session->Finish();
 	Check(session->Done() != 0, "finished session accepted work");
 	std::puts("PS4_GNM unit validation/transaction/lease/state/user-SGPR checks PASS");
@@ -318,6 +420,48 @@ static void InterpolationUnitTests() {
 	Check(!session->Submit(1, Arrays, Sizes, 0, 0) && counts->calls == 6, session->LastError());
 	Check(counts->shaders[4] != counts->shaders[5], "linear interpolation qualifier missing");
 
+	// Default attributes require no mapped PARAM read or barycentric input.
+	for (uint32_t selector = 0; selector < 4; ++selector) {
+		std::vector<uint32_t> defaults;
+		Reg(defaults, 0x69, 0x1b3, {0, 0});
+		const uint32_t control = 0x20u | (selector << 8);
+		Reg(defaults, 0x69, 0x191, {control, control, control, control});
+		defaults.insert(defaults.end(), draw.begin(), draw.end());
+		memory.Put(Commands, defaults);
+		memory.Put(Sizes, std::vector<uint32_t> {uint32_t(defaults.size() * 4)});
+		Check(!session->Submit(1, Arrays, Sizes, 0, 0), session->LastError());
+	}
+	memory.Put(Ps, Graphics::ShaderRecompiler::Gcn::FlatPixelFixture());
+	std::vector<uint32_t> flat;
+	Reg(flat, 0x69, 0x191, {0x400});
+	flat.insert(flat.end(), draw.begin(), draw.end());
+	memory.Put(Commands, flat);
+	memory.Put(Sizes, std::vector<uint32_t> {uint32_t(flat.size() * 4)});
+	Check(!session->Submit(1, Arrays, Sizes, 0, 0), session->LastError());
+	for (uint32_t mode = 0; mode < 15; ++mode) {
+		const auto masked = mode < 3 ? Graphics::ShaderRecompiler::Gcn::MaskedPixelFixture(mode == 1, mode == 2)
+		    : mode < 8 ? Graphics::ShaderRecompiler::Gcn::ElsePixelFixture(mode != 4, mode == 7, mode == 5 ? 0 : mode == 6 ? 15 : 1)
+		    : mode < 10 ? Graphics::ShaderRecompiler::Gcn::IntegerComparePixelFixture(mode == 9)
+		                : Graphics::ShaderRecompiler::Gcn::CmpxPixelFixture(mode - 10);
+		memory.Put(Ps, masked);
+		std::vector<uint32_t> mask_state;
+		Reg(mask_state, 0x69, 0x1b3, {2, 2});
+		Reg(mask_state, 0x69, 0x191, {0, 0x20, 0x20, 0x20});
+		Reg(mask_state, 0x76, 0xa, {0xc0083}); // sixteen VGPRs and24 SGPRs
+		mask_state.insert(mask_state.end(), draw.begin(), draw.end());
+		memory.Put(Commands, mask_state);
+		memory.Put(Sizes, std::vector<uint32_t> {uint32_t(mask_state.size() * 4)});
+		Check(!session->Submit(1, Arrays, Sizes, 0, 0), session->LastError());
+		if (mode != 2 && mode != 8 && mode != 9) {
+			auto insufficient = mask_state;
+			insufficient.resize(insufficient.size() - draw.size());
+			Reg(insufficient, 0x76, 0xa, {0xc0043}); // only16 SGPRs; saved pair starts at16
+			insufficient.insert(insufficient.end(), draw.begin(), draw.end());
+			memory.Put(Commands, insufficient);
+			memory.Put(Sizes, std::vector<uint32_t> {uint32_t(insufficient.size() * 4)});
+			reject();
+		}
+	}
 	session->Finish();
 	std::puts("PS4_GNM interpolation/ALU mapping/register/pair rejects and state rollback PASS");
 }
@@ -591,15 +735,128 @@ static void IndexedUnitTests(bool vertex) {
 	std::printf("PS4_GNM %s two buffers, data updates, ranges/alias/group rejects PASS\n",
 	            vertex ? "vertex fetch" : "indexed MUBUF");
 }
-static void TextureUnitTests() {
+static void ExternalFetchUnitTests() {
+	Memory memory;
+	std::string error;
+	auto counts = std::make_shared<Counts>();
+	constexpr uint64_t table_address = 0x414000, fetch_address = 0x415000;
+	const auto fetch = Graphics::ShaderRecompiler::Gcn::ExternalFetchFunctionFixture();
+	memory.Put(Vs, Graphics::ShaderRecompiler::Gcn::ExternalFetchVertexFixture());
+	memory.Put(Ps, Graphics::ShaderRecompiler::Gcn::InterpolatedPixelFixture());
+	memory.Put(fetch_address, fetch);
+	memory.Put(table_address, std::vector<uint32_t> {0x410000, 16u << 16, 4, 0xfac,
+	                                                0x410100, 16u << 16, 4, 0xfac});
+	memory.Put(VsRegs, std::vector<uint32_t> {uint32_t(Vs >> 8), 0, 0xc0042, 12, 0, 4, 0});
+	memory.Put(PsRegs, std::vector<uint32_t> {uint32_t(Ps >> 8), 0, 0xc0001, 0, 0, 9, 2, 2, 1, 0, 0, 15});
+	const auto update = [&](bool changed) {
+		const auto data = Ps4TextureTests::Make(0, 0, changed);
+		memory.Put(0x410000, data.positions);
+		memory.Put(0x410100, data.colors);
+	};
+	update(false);
+	auto session = Ps4::GnmSession::Create(memory.Access(), error,
+	    std::make_unique<RecordingRenderer>(memory, counts));
+	Check(bool(session), error);
+	Check(!session->SetShader(true, Commands, 29, VsRegs) &&
+	          !session->SetShader(false, Commands + 29 * 4, 40, PsRegs), "external fetch builders");
+	auto commands = memory.Words(Commands, 69);
+	const auto state = StateWords(Target, 0, true);
+	commands.insert(commands.end(), state.begin(), state.end());
+	Reg(commands, 0x76, 0x4c, {0, 0, uint32_t(table_address), 0, uint32_t(fetch_address), 0});
+	Check(!session->Draw(Commands + commands.size() * 4, 7, 3, 0), "external fetch draw builder");
+	const auto draw = memory.Words(Commands + commands.size() * 4, 7);
+	commands.insert(commands.end(), draw.begin(), draw.end());
+	const auto submit = [&](const std::vector<uint32_t>& words) {
+		memory.Put(Commands, words);
+		memory.Put(Arrays, std::vector<uint64_t> {Commands});
+		memory.Put(Sizes, std::vector<uint32_t> {uint32_t(words.size() * 4)});
+		return session->Submit(1, Arrays, Sizes, 0, 0);
+	};
+	Check(!submit(commands), session->LastError());
+	update(true);
+	Check(!submit(commands), session->LastError());
+	Check(counts->calls == 2 && counts->vertex_shaders[0] == counts->vertex_shaders[1] &&
+	          counts->resources[0][2] != counts->resources[1][2] &&
+	          counts->resources[0][3] != counts->resources[1][3],
+	      "external fetch updates must reach both GPU resource snapshots without changing code");
+	const auto reject = [&](const std::vector<uint32_t>& words) {
+		memory.Put(Commands, words);
+		memory.Put(Arrays, std::vector<uint64_t> {Commands});
+		memory.Put(Sizes, std::vector<uint32_t> {uint32_t(words.size() * 4)});
+		const auto saved = memory.data;
+		const auto calls = counts->calls;
+		Check(session->Submit(1, Arrays, Sizes, 0, 0) != 0 && memory.data == saved &&
+		          counts->calls == calls && !memory.pinned, "invalid external fetch had effects");
+	};
+	for (uint32_t width: {2u, 4u}) {
+		constexpr uint64_t index_address = 0x414100;
+		if (width == 2) memory.Put(index_address, std::vector<uint16_t> {1, 3, 2});
+		else memory.Put(index_address, std::vector<uint32_t> {1, 3, 2});
+		auto indexed = commands;
+		indexed.resize(indexed.size() - draw.size());
+		indexed.insert(indexed.end(), {0xc0002a00u, width == 4 ? 1u : 0u});
+		Check(!session->DrawIndexed(Commands + indexed.size() * 4, 10, 3, index_address, 0, 0),
+		      "indexed draw builder");
+		const auto packet = memory.Words(Commands + indexed.size() * 4, 10);
+		indexed.insert(indexed.end(), packet.begin(), packet.end());
+		Check(!submit(indexed) && counts->indices.back().size() == width * 3 &&
+		          counts->index_bytes.back() == width, session->LastError());
+		auto bad_indices = indexed;
+		bad_indices[bad_indices.size() - 10 + 2] = uint32_t(Target);
+		reject(bad_indices);
+		bad_indices = indexed;
+		bad_indices[bad_indices.size() - 10 + 2] = 0x600000;
+		reject(bad_indices);
+		bad_indices = indexed;
+		bad_indices[bad_indices.size() - 10 + 2] = uint32_t(index_address + 1);
+		reject(bad_indices);
+		bad_indices = indexed;
+		bad_indices[bad_indices.size() - 10 + 1] = 2; // max_size smaller than draw count
+		reject(bad_indices);
+		const auto saved = memory.data;
+		Check(session->DrawIndexed(Commands, 10, 3, index_address, 1, 0) != 0 && memory.data == saved,
+		      "unsupported indexed builder had effects");
+	}
+	auto bad_fetch = fetch;
+	bad_fetch.back() = 0xbe802002; // wrong return link pair
+	memory.Put(fetch_address, bad_fetch);
+	reject(commands);
+	memory.Put(fetch_address, fetch);
+	auto bad = commands;
+	bad.resize(bad.size() - draw.size());
+	Reg(bad, 0x76, 0x4a, {0xc0002}); // eight SGPRs cannot hold descriptors s8..15
+	bad.insert(bad.end(), draw.begin(), draw.end());
+	reject(bad);
+	memory.Put(Target, fetch);
+	bad = commands;
+	bad.resize(bad.size() - draw.size());
+	Reg(bad, 0x76, 0x50, {uint32_t(Target), 0});
+	bad.insert(bad.end(), draw.begin(), draw.end());
+	reject(bad);
+	Check(session->LastError().find("scalar table aliases") != std::string::npos,
+	      "external fetch code/target alias was not rejected");
+	session->Finish();
+	std::puts("PS4_GNM external typed fetch -> two GPU buffer snapshots, updates/link/alias/RSRC rejects PASS");
+}
+static void TextureUnitTests(bool sampled = false, bool indirect = false) {
 	Memory      memory;
 	std::string error;
 	auto        counts = std::make_shared<Counts>();
-	memory.Put(Vs, Graphics::ShaderRecompiler::Gcn::TextureVertexFixture());
-	memory.Put(Ps, Graphics::ShaderRecompiler::Gcn::TexturePixelFixture());
-	memory.Put(VsRegs, std::vector<uint32_t> {uint32_t(Vs >> 8), 0, 0xc0043, 32, 0, 4, 0});
+	memory.Put(Vs, indirect ? Graphics::ShaderRecompiler::Gcn::TableSampledTextureFixture(
+	                            Graphics::ShaderRecompiler::Gcn::Stage::Vertex)
+	                       : sampled ? Graphics::ShaderRecompiler::Gcn::SampledTextureFixture(
+	                            Graphics::ShaderRecompiler::Gcn::Stage::Vertex)
+	                       : Graphics::ShaderRecompiler::Gcn::TextureVertexFixture());
+	memory.Put(Ps, indirect ? Graphics::ShaderRecompiler::Gcn::TableSampledTextureFixture(
+	                            Graphics::ShaderRecompiler::Gcn::Stage::Pixel)
+	                       : sampled ? Graphics::ShaderRecompiler::Gcn::SampledTextureFixture(
+	                            Graphics::ShaderRecompiler::Gcn::Stage::Pixel)
+	                       : Graphics::ShaderRecompiler::Gcn::TexturePixelFixture());
+	memory.Put(VsRegs, std::vector<uint32_t> {uint32_t(Vs >> 8), 0,
+	                                         indirect ? 0xc0143u : sampled ? 0xc0083u : 0xc0043u, indirect ? 4u : 32u, 0, 4, 0});
 	memory.Put(PsRegs,
-	           std::vector<uint32_t> {uint32_t(Ps >> 8), 0, 0xc0084, 32, 0, 9, 2, 2, 1, 0, 0, 15});
+	           std::vector<uint32_t> {uint32_t(Ps >> 8), 0, indirect ? 0xc0143u : 0xc0084u,
+	                                    indirect ? 4u : 32u, 0, 9, 2, 2, 1, 0, 0, 15});
 	const auto store = [&](uint64_t address, std::span<const uint8_t> bytes) {
 		memory.Put(address, std::vector<uint8_t>(bytes.begin(), bytes.end()));
 	};
@@ -621,14 +878,25 @@ static void TextureUnitTests() {
 	auto commands = memory.Words(Commands, 69);
 	auto state    = StateWords(Target, 0, true);
 	commands.insert(commands.end(), state.begin(), state.end());
+	std::array<std::vector<uint32_t>, 2> tables;
 	const auto add_users = [&](uint32_t reg, bool vertex) {
 		std::vector<uint32_t> users =
 		    vertex ? std::vector<uint32_t> {0x410000, 16u << 16, 4, 0xfac,
 		                                    0x410040, 16u << 16, 4, 0xfac}
 		           : std::vector<uint32_t> {0x410100, 0, 16, 0xfac, 0x410200, 16u << 16, 4, 0xfac};
+		if (sampled) users = {vertex ? 0x410000u : 0x410200u, 0, 64, 0xfac, 0x92, 0, 0, 0};
 		auto image = Ps4TextureTests::ImageWords(vertex ? 0x410800 : 0x411000);
 		users.insert(users.end(), image.begin(), image.end());
-		commands.push_back(0xc0107600);
+		if (indirect) {
+			users = vertex ? std::vector<uint32_t> {0x410000, 0, 64, 0xfac, 0x410040, 0, 64, 0xfac}
+			               : std::vector<uint32_t> {0x410100, 0, 16, 0xfac, 0x410200, 0, 64, 0xfac};
+			users.insert(users.end(), image.begin(), image.end());
+			users.insert(users.end(), {0x92, 0, 0, 0});
+			tables[vertex ? 1 : 0] = users;
+			memory.Put(vertex ? 0x412000 : 0x413000, users);
+			users = {vertex ? 0x412000u : 0x413000u, 0};
+		}
+		commands.push_back(0xc0007600u | (uint32_t(users.size()) << 16));
 		commands.push_back(reg);
 		const auto at = commands.size();
 		commands.insert(commands.end(), users.begin(), users.end());
@@ -652,10 +920,15 @@ static void TextureUnitTests() {
 	Check(counts->shaders[0] == counts->shaders[1] &&
 	          counts->vertex_shaders[0] == counts->vertex_shaders[1],
 	      "resource updates changed shader modules");
-	for (size_t resource = 0; resource < 6; ++resource)
+	for (size_t resource = 0; resource < 6; ++resource) {
+		if (sampled && !indirect && (resource == 1 || resource == 3)) {
+			Check(counts->resources[0][resource].empty(), "sampler treated as buffer payload");
+			continue;
+		}
 		Check(!counts->resources[0][resource].empty() &&
 		          counts->resources[0][resource] != counts->resources[1][resource],
 		      "independent resource snapshot missing/update lost");
+	}
 	const auto reject = [&](const auto& words) {
 		memory.Put(Commands, words);
 		memory.Put(Arrays, std::vector<uint64_t> {Commands});
@@ -667,6 +940,35 @@ static void TextureUnitTests() {
 		          counts->calls == calls && memory.writes == writes,
 		      "invalid texture batch had effects");
 	};
+	if (indirect) {
+		for (size_t at: {vs_at, ps_at}) {
+			auto bad = commands;
+			bad[at] = 0x600000; // absent complete table mapping
+			reject(bad);
+		}
+		memory.Put(Target, tables[1]);
+		auto bad = commands;
+		bad[vs_at] = uint32_t(Target);
+		reject(bad);
+		Check(session->LastError().find("scalar table aliases") != std::string::npos,
+		      "scalar table/target alias must be rejected before renderer");
+		session->Finish();
+		std::puts("PS4_GNM S_LOAD table -> two buffers + texture + sampler VS/PS snapshots PASS");
+		return;
+	}
+	if (sampled) {
+		for (size_t base: {vs_at, ps_at})
+			for (size_t n = 4; n < 8; ++n) {
+				auto bad = commands;
+				bad[base + n] ^= 1;
+				reject(bad);
+			}
+		auto bad = commands;
+		bad.resize(bad.size() - draw.size());
+		Reg(bad, 0x76, 0x4a, {0xc0043}); // sixteen SGPRs cannot contain s16..19
+		bad.insert(bad.end(), draw.begin(), draw.end());
+		reject(bad);
+	}
 	for (size_t base: {vs_at, ps_at})
 		for (const auto& field:
 		     std::vector<std::pair<uint32_t, uint32_t>> {{8, 0},
@@ -844,7 +1146,10 @@ int main(int argc, char** argv) {
 	BufferUnitTests();
 	IndexedUnitTests(false);
 	IndexedUnitTests(true);
+	ExternalFetchUnitTests();
 	TextureUnitTests();
+	TextureUnitTests(true);
+	TextureUnitTests(true, true);
 	if (argc != 2 || std::string_view(argv[1]) != "--unit-only")
 		RuntimeTest(subsystems,
 		            argc >= 2 ? std::filesystem::path(argv[1])

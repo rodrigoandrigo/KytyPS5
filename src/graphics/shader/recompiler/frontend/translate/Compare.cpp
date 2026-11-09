@@ -10,6 +10,13 @@ void Translator::EmitCompareResult(const Decoder::Instruction& inst, IR::U1 valu
 		ir.SetScc(value);
 		return;
 	}
+	if (inst.gcn_cmpx_updates_vcc_exec) {
+		// The incoming EXEC gates both results. Writing VCC first leaves EXEC
+		// intact for the second update; no scalar condition code is modified.
+		WriteVectorMask(ConditionOperand(Decoder::OperandKind::VccLo), value);
+		WriteVectorMask(ConditionOperand(Decoder::OperandKind::ExecLo), value);
+		return;
+	}
 	WriteVectorMask(inst.dst, value);
 }
 
