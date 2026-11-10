@@ -82,10 +82,16 @@ struct Counts {
 	std::vector<std::vector<uint32_t>>               shaders, vertex_shaders;
 	std::vector<std::vector<uint8_t>>                buffers;
 	std::vector<std::vector<uint8_t>>                buffers2;
+	std::vector<std::vector<uint8_t>>                buffers3;
+	std::vector<std::vector<uint8_t>>                buffers5;
+	std::vector<std::vector<uint8_t>>                pixel_images2;
+	std::vector<std::vector<uint8_t>>                pixel_images4;
 	std::vector<std::array<std::vector<uint8_t>, 6>> resources;
 	std::vector<std::vector<uint8_t>>                indices;
 	std::vector<uint32_t>                            index_bytes;
 	bool                                             fail = false;
+	std::unique_ptr<Graphics::Ps4::GnmRenderer>       gpu;
+	std::vector<std::array<uint8_t, 4>>              gpu_pixels;
 };
 class RecordingRenderer final: public Graphics::Ps4::GnmRenderer {
 	Memory&                 memory;
@@ -108,6 +114,13 @@ public:
 		const auto second = state.pixel_buffer.empty() ? state.vertex_buffer2 : state.pixel_buffer2;
 		counts->buffers.emplace_back(first.begin(), first.end());
 		counts->buffers2.emplace_back(second.begin(), second.end());
+		counts->buffers3.emplace_back(state.pixel_buffer3.begin(), state.pixel_buffer3.end());
+		const auto fifth = state.pixel_buffer_tail[1];
+		counts->buffers5.emplace_back(fifth.begin(), fifth.end());
+		counts->pixel_images2.emplace_back(state.pixel_texture2.pixels.begin(),
+		                                  state.pixel_texture2.pixels.end());
+		const auto fourth = state.pixel_texture_tail.back().pixels;
+		counts->pixel_images4.emplace_back(fourth.begin(), fourth.end());
 		const std::span<const uint8_t> spans[] = {
 		    state.pixel_buffer,   state.pixel_buffer2,        state.vertex_buffer,
 		    state.vertex_buffer2, state.pixel_texture.pixels, state.vertex_texture.pixels};
@@ -118,6 +131,15 @@ public:
 		if (counts->fail) {
 			error = "injected GPU failure";
 			return false;
+		}
+		if (counts->gpu) {
+			if (!counts->gpu->Render(state, vs, ps, output, error)) return false;
+			const size_t pixel = (size_t(8) * state.width + 16) * 4;
+			Check(pixel + 4 <= output.size(), "ordered SRT GPU output size");
+			std::array<uint8_t, 4> rgba;
+			std::copy_n(output.begin() + pixel, 4, rgba.begin());
+			counts->gpu_pixels.push_back(rgba);
+			return true;
 		}
 		output.assign(state.initial_pixels.begin(), state.initial_pixels.end());
 		output[0] = uint8_t(100 + counts->calls);
@@ -587,7 +609,7 @@ static void TransferUnitTests() {
 	session->Finish();
 	std::puts("PS4_GNM transfer ordering, cross-DCB, budgets, alias and rollback PASS");
 }
-static void BufferUnitTests() {
+static void BufferUnitTests(bool gpu = false) {
 	Memory      memory;
 	std::string error;
 	auto        counts = std::make_shared<Counts>();
@@ -641,6 +663,187 @@ static void BufferUnitTests() {
 		      "bad buffer descriptor had effects");
 	}
 	Check(!submit(commands), session->LastError());
+	auto raw_code = Graphics::ShaderRecompiler::Gcn::BufferPixelFixture(4);
+	raw_code[0] &= ~(8u << 22); // S_LOAD_DWORDX4, with a two-word address.
+	raw_code.insert(raw_code.begin(), 0xbf820000u); // Enter the body before loading.
+	memory.Put(Ps, raw_code);
+	Check(!submit(commands), session->LastError());
+	Check(counts->buffers.back().size() == 16 && counts->buffers.back()[0] == 0x22,
+	      "body S_LOAD did not bind the exact guest range");
+	auto unreadable = commands;
+	unreadable[descriptor_at] = 0x600000;
+	const auto calls = counts->calls;
+	Check(submit(unreadable) != 0 && counts->calls == calls,
+	      "body S_LOAD accepted unreadable guest memory");
+	raw_code[0] = 0xbe880391u; // s8 = 17, aligned down to byte 16 by SMRD.
+	raw_code[1] = 0xc0820008u;
+	memory.Put(Ps, raw_code);
+	auto dynamic = commands;
+	const uint32_t buffer_end = uint32_t(Base + memory.data.size());
+	dynamic[descriptor_at] = buffer_end - 32;
+	memory.Put(buffer_end - 32, std::vector<uint32_t>(8, 0x33333333));
+	// Allocate s8 in the PS program resource register.
+	auto rsrc1 = std::find(dynamic.begin(), dynamic.end(), 0xc0000u);
+	Check(rsrc1 != dynamic.end(), "PS resource register fixture");
+	*rsrc1 |= 0x40;
+	Check(!submit(dynamic), session->LastError());
+	Check(counts->buffers.back().size() == 32 && counts->buffers.back()[16] == 0x33,
+	      "SGPR S_LOAD did not stop at the mapping boundary");
+	memory.Put(Ps, std::vector<uint32_t> {
+	    0xc2080100u, 0xc2088500u, 0xc2090900u, 0xbf8c007fu,
+	    0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e0602f2u,
+	    0xf800180fu, 0x03020100u, 0xbf810000u});
+	auto three = commands;
+	three.resize(three.size() - draw.size());
+	Reg(three, 0x76, 0xa, {0xc0080, 24});
+	Reg(three, 0x76, 0xc, {0x404b80, 0, 16, 0xfac, 0x404b90, 0, 16, 0xfac,
+	                       0x404ba0, 0, 16, 0xfac});
+	const size_t third_base = three.size() - 4;
+	three.insert(three.end(), draw.begin(), draw.end());
+	memory.Put(0x404ba0, std::vector<uint32_t>(4, 0x44444444));
+	Check(!submit(three), session->LastError());
+	Check(counts->buffers3.back().size() == 16 && counts->buffers3.back()[0] == 0x44,
+	      "third buffer missing from GNM draw snapshot");
+	three[third_base] = uint32_t(Target);
+	const auto calls_before_alias = counts->calls;
+	Check(submit(three) != 0 && counts->calls == calls_before_alias &&
+	          session->LastError().find("aliases a draw target") != std::string::npos,
+	      "GNM accepted a third buffer aliasing the draw target");
+	memory.Put(Ps, std::vector<uint32_t> {
+	    0xc0040002u, 0xbf8c007fu, 0xc0880008u, 0xbf8c007fu,
+	    0x7e000280u, 0xe0382000u, 0x80040100u, 0xbf8c0f70u,
+	    0xf800180fu, 0x04030201u, 0xbf810000u});
+	auto table_draw = commands;
+	table_draw.resize(table_draw.size() - draw.size());
+	Reg(table_draw, 0x76, 0xa, {0xc0081, 6});
+	Reg(table_draw, 0x76, 0xc, {buffer_end - 80, 0, 0});
+	table_draw.insert(table_draw.end(), draw.begin(), draw.end());
+	memory.Put(buffer_end - 80, std::vector<uint32_t> {
+	    16, 0, 0, 0, 0x404b80, 16u << 16, 1, 0xfac, 0x404ba0, 16u << 16, 1, 0xfac,
+	    0x404bb0, 16u << 16, 1, 0xfac, 0x404bc0, 16u << 16, 1, 0xfac});
+	memory.Put(0x404bc0, std::vector<uint32_t>(4, 0x67676767));
+	Check(!submit(table_draw), session->LastError());
+	const auto table_shader = counts->shaders.back();
+	Check(counts->buffers.back().size() == 80 && counts->buffers2.back()[0] == 0x22 &&
+	          counts->buffers3.back()[0] == 0x44 && counts->buffers5.back().size() == 16 &&
+	          counts->buffers5.back()[0] == 0x67, "dynamic SRT snapshots missing");
+	memory.Put(buffer_end - 80, std::vector<uint32_t> {64});
+	Check(!submit(table_draw), session->LastError());
+	Check(counts->buffers.back()[0] == 64 && counts->shaders.back() == table_shader,
+	      "SRT selector update must reach the GPU without changing the shader");
+	auto ordered = table_draw;
+	Write(ordered, buffer_end - 80, 16);
+	Fill(ordered, buffer_end - 80, 4, 32);
+	ordered.insert(ordered.end(), draw.begin(), draw.end());
+	const auto first_ordered = counts->buffers.size();
+	if (gpu) {
+		memory.Put(0x404bc0, std::array<float, 4> {1, 0, 0, 1});
+		memory.Put(0x404ba0, std::array<float, 4> {0, 1, 0, 1});
+		counts->gpu = Graphics::Ps4::CreateGnmRenderer(error);
+		Check(bool(counts->gpu), error);
+	}
+	Check(!submit(ordered), session->LastError());
+	Check(counts->buffers[first_ordered][0] == 64 &&
+	          counts->buffers[first_ordered + 1][0] == 32 &&
+	          counts->shaders[first_ordered] == counts->shaders[first_ordered + 1] &&
+	          memory.Words(buffer_end - 80, 1)[0] == 32,
+	      "ordered PM4 table writes were not visible to the second draw");
+	if (gpu) {
+		Check(counts->gpu_pixels == std::vector<std::array<uint8_t, 4>> {
+		          {255, 0, 0, 255}, {0, 255, 0, 255}}, "ordered SRT draw GPU colors");
+		std::printf("PS4_GNM ordered SRT WRITE_DATA/DMA_DATA two draws GPU PASS (%s)\n",
+		            counts->gpu->Name());
+		counts->gpu.reset();
+	}
+	auto invalid_ordered = ordered;
+	invalid_ordered.insert(invalid_ordered.end(), {0xc0009900u, 0});
+	memory.Put(buffer_end - 80, std::vector<uint32_t> {64});
+	const auto calls_before_bad_table = counts->calls;
+	Check(submit(invalid_ordered) != 0 && counts->calls == calls_before_bad_table &&
+	          memory.Words(buffer_end - 80, 1)[0] == 64,
+	      "invalid batch published a staged table write");
+	counts->fail = true;
+	Check(submit(ordered) != 0 && memory.Words(buffer_end - 80, 1)[0] == 64,
+	      "failed host draw published a staged table write");
+	counts->fail = false;
+	if (gpu) {
+		const uint32_t table_address = buffer_end - 48;
+		memory.Put(table_address, std::vector<uint32_t> {16, 0, 0, 0,
+		    0x404bc0, 16u << 16, 1, 0xfac, 0x404ba0, 16u << 16, 1, 0xfac});
+		memory.Put(Ps, std::vector<uint32_t> {
+		    0x7e000280u, 0x7e0a02a0u, 0xe0702000u, 0x80010500u, 0xbf8c0f70u,
+		    0xc0040002u, 0xbf8c007fu, 0xc0880008u, 0xbf8c007fu,
+		    0xe0382000u, 0x80040100u, 0xbf8c0f70u, 0xf800180fu, 0x04030201u, 0xbf810000u});
+		auto store_draw = commands;
+		store_draw.resize(store_draw.size() - draw.size());
+		Reg(store_draw, 0x69, 0x90, {0x80080010u, 0x00090011u});
+		Reg(store_draw, 0x76, 0xa, {0xc0081, 16});
+		Reg(store_draw, 0x76, 0xc, {table_address, 0, 0, 0, table_address, 4u << 16, 12, 0xfac});
+		store_draw.insert(store_draw.end(), draw.begin(), draw.end());
+		counts->fail = true;
+		Check(submit(store_draw) != 0 && memory.Words(table_address, 1)[0] == 16,
+		      "failed raster published a GCN store");
+		counts->fail = false;
+		counts->gpu = Graphics::Ps4::CreateGnmRenderer(error);
+		Check(bool(counts->gpu), error);
+		counts->gpu_pixels.clear();
+		Check(!submit(store_draw), session->LastError());
+		Check(counts->gpu_pixels == std::vector<std::array<uint8_t, 4>> {{0, 255, 0, 255}} &&
+		          memory.Words(table_address, 1)[0] == 32, "GCN store SRT color or guest publication");
+		std::printf("PS4_GNM GCN store -> SRT -> MUBUF and guest publication PASS (%s)\n",
+		            counts->gpu->Name());
+		counts->gpu.reset();
+	}
+	memory.Put(Ps, std::vector<uint32_t> {
+	    0x7e140280u, 0x7e160280u, 0xf0001f00u, 0x0000040au, 0x7e140281u,
+	    0xf0001f00u, 0x0002160au, 0xbf8c0f70u, 0xf800180fu, 0x07061704u, 0xbf810000u});
+	auto image_draw = commands;
+	image_draw.resize(image_draw.size() - draw.size());
+	Reg(image_draw, 0x76, 0xa, {0xc0046, 32});
+	Reg(image_draw, 0x76, 0xc, {0x4100, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+	                           0x4110, 10u << 20, 1, 0x90800facu, 63u << 13, 0, 0, 0});
+	const size_t second_image_base = image_draw.size() - 8;
+	image_draw.insert(image_draw.end(), draw.begin(), draw.end());
+	memory.Put(0x411000, std::vector<uint8_t>(256, 0x56));
+	Check(!submit(image_draw), session->LastError());
+	Check(counts->pixel_images2.back().size() == 256 && counts->pixel_images2.back()[0] == 0x56,
+	      "second image missing from GNM draw snapshot");
+	image_draw[second_image_base] = uint32_t(Target >> 8);
+	const auto calls_before_image_alias = counts->calls;
+	Check(submit(image_draw) != 0 && counts->calls == calls_before_image_alias &&
+	          session->LastError().find("aliases a draw target") != std::string::npos,
+	      "GNM accepted a second image aliasing the draw target");
+	memory.Put(Ps, std::vector<uint32_t> {
+	    0xc0040002u, 0xbf8c007fu, 0xc0c80008u, 0xbf8c007fu,
+	    0x7e140280u, 0x7e160280u, 0xf0001f00u, 0x0004040au,
+	    0xbf8c0f70u, 0xf800180fu, 0x07060504u, 0xbf810000u});
+	auto image_srt = commands;
+	image_srt.resize(image_srt.size() - draw.size());
+	Reg(image_srt, 0x76, 0xa, {0xc0086, 6});
+	Reg(image_srt, 0x76, 0xc, {buffer_end - 144, 0, 0});
+	image_srt.insert(image_srt.end(), draw.begin(), draw.end());
+	auto image_table = std::vector<uint32_t> {16, 0, 0, 0,
+	    0x4100, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+	    0x4110, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+	    0x4120, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+	    0x4130, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0};
+	memory.Put(buffer_end - 144, image_table);
+	memory.Put(0x413000, std::vector<uint8_t>(256, 0x78));
+	Check(!submit(image_srt), session->LastError());
+	const auto image_shader = counts->shaders.back();
+	Check(counts->buffers.back().size() == 144 && counts->pixel_images2.back().size() == 256 &&
+	          counts->pixel_images2.back()[0] == 0x56 && counts->pixel_images4.back().size() == 256 &&
+	          counts->pixel_images4.back()[0] == 0x78, "GNM image SRT snapshots");
+	memory.Put(buffer_end - 144, std::vector<uint32_t> {112});
+	Check(!submit(image_srt), session->LastError());
+	Check(counts->buffers.back()[0] == 112 && counts->shaders.back() == image_shader,
+	      "GNM image SRT selector refresh");
+	image_table[28] = uint32_t(Target >> 8);
+	memory.Put(buffer_end - 144, image_table);
+	const auto calls_before_fourth_alias = counts->calls;
+	Check(submit(image_srt) != 0 && counts->calls == calls_before_fourth_alias &&
+	          session->LastError().find("aliases a draw target") != std::string::npos,
+	      "GNM accepted a fourth image aliasing the draw target");
 	session->Finish();
 	std::puts("PS4_GNM buffer snapshot/data update/binding alias and descriptor rejects PASS");
 }
@@ -1143,14 +1346,15 @@ int main(int argc, char** argv) {
 	UnitTests();
 	InterpolationUnitTests();
 	TransferUnitTests();
-	BufferUnitTests();
+	const bool srt_gpu = argc == 2 && std::string_view(argv[1]) == "--srt-write-gpu";
+	BufferUnitTests(srt_gpu);
 	IndexedUnitTests(false);
 	IndexedUnitTests(true);
 	ExternalFetchUnitTests();
 	TextureUnitTests();
 	TextureUnitTests(true);
 	TextureUnitTests(true, true);
-	if (argc != 2 || std::string_view(argv[1]) != "--unit-only")
+	if (!srt_gpu && (argc != 2 || std::string_view(argv[1]) != "--unit-only"))
 		RuntimeTest(subsystems,
 		            argc >= 2 ? std::filesystem::path(argv[1])
 		                      : std::filesystem::path("ps4-gnm-fixture"),

@@ -27,7 +27,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
-		case O::S_WAITCNT: return;
+		case O::S_WAITCNT:
+			if (inst.secondary_offset) ir.Emit(IR::ValueOpcode::DataCacheInvalidate, {}, 1u);
+			return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
@@ -41,6 +43,18 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
 			return;
+		case O::S_OR_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
+		case O::S_XOR_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true);
+		case O::S_ANDN2_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true);
+		case O::S_NAND_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true, true);
+		case O::S_NOR_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true, true);
+		case O::S_XNOR_SAVEEXEC_B64:
+			return S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true, true);
 		case O::S_ANDN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
 			return;

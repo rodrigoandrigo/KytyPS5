@@ -64,8 +64,12 @@ int wmain(int argc, wchar_t** argv) {
 	Check(SUCCEEDED(create(CLSID_DxcValidator, IID_PPV_ARGS(&validator))), "create validator");
 	Check(spirv_to_dxil_get_runtime_conf_size() == sizeof(dxil_spirv_runtime_conf),
 	      "Mesa config ABI");
-	for (int variant = 0; variant < 42; ++variant) {
-		const auto              vs_name = variant >= 25   ? "gcn-interp.vert"
+	for (int variant = 0; variant < 59; ++variant) {
+		const auto              vs_name = variant == 56   ? "gcn-eight.vert"
+		                                  : variant == 53   ? "gcn-two-images.vert"
+		                                  : variant == 48   ? "gcn-three.vert"
+		                                  : variant >= 44   ? "gcn-small.vert"
+		                                  : variant >= 25   ? "gcn-interp.vert"
 		                                  : variant == 24   ? "gcn-external-fetch.vert"
 		                                  : variant >= 19   ? "gcn-interp.vert"
 		                                  : variant == 18   ? "gcn-table-sample.vert"
@@ -91,6 +95,23 @@ int wmain(int argc, wchar_t** argv) {
 		                                  : variant == 39 ? "gcn-icmp6.frag"
 		                                  : variant == 40 ? "gcn-cfg-exit0.frag"
 		                                  : variant == 41 ? "gcn-cfg-exit1.frag"
+		                                  : variant == 42 ? "gcn-cfg-frame0.frag"
+		                                  : variant == 43 ? "gcn-cfg-frame1.frag"
+		                                  : variant == 44 ? "gcn-raw-load.frag"
+		                                  : variant == 45 ? "gcn-raw-sgpr.frag"
+		                                  : variant == 46 ? "gcn-raw-short1.frag"
+		                                  : variant == 47 ? "gcn-raw-short2.frag"
+		                                  : variant == 48 ? "gcn-three.frag"
+		                                  : variant == 49 ? "gcn-mubuf-soffset.frag"
+		                                  : variant == 50 ? "gcn-mubuf-table.frag"
+		                                  : variant == 51 ? "gcn-mubuf-join.frag"
+		                                  : variant == 52 ? "gcn-mubuf-loop.frag"
+		                                  : variant == 53 ? "gcn-two-images.frag"
+		                                  : variant == 54 ? "gcn-image-srt-load.frag"
+		                                  : variant == 55 ? "gcn-image-srt-sample.frag"
+		                                  : variant == 56 ? "gcn-eight.frag"
+		                                  : variant == 57 ? "gcn-raster-storage.frag"
+		                                  : variant == 58 ? "gcn-srt-store.frag"
 		                                  : variant == 28   ? "gcn-else0.frag"
 		                                  : variant == 29 ? "gcn-else1.frag"
 		                                  : variant == 30 ? "gcn-else2.frag"

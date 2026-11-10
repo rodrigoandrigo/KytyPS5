@@ -264,7 +264,10 @@ int main(int argc, char** argv) {
 		const uint32_t        descriptor[] = {0x200000, 0, 64, 0xfac};
 		std::vector<uint32_t> words;
 		Gcn::BufferDescriptor resource;
-		Check(Gcn::Compile(Gcn::BufferPixelFixture(4), Gcn::Stage::Pixel, words, error, descriptor,
+		auto code = Gcn::BufferPixelFixture(4);
+		code[0] = 0xc2820008u; // S_BUFFER_LOAD_DWORDX4 s[4:7], s[0:3], s8
+		code.insert(code.begin(), {0xc2040100u, 0xbf8c007fu}); // Runtime byte offset from buffer DWORD zero.
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, descriptor,
 		                   0, &resource),
 		      error);
 		Check(resource.address == 0x200000 && resource.size == 64, "descriptor decode");
@@ -272,11 +275,250 @@ int main(int argc, char** argv) {
 		std::ofstream file(folder / "gcn-buffer.frag.spv", std::ios::binary);
 		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
 		Check(bool(file), "write buffer SPIR-V");
-		const auto    code = Gcn::BufferPixelFixture(4);
 		std::ofstream source(folder / "gcn-buffer.frag.gcn", std::ios::binary);
 		source.write(reinterpret_cast<const char*>(code.data()), code.size() * 4);
 		Check(bool(source), "write SMRD GCN fixture");
 		std::puts("PS4_GCN s_buffer_load_dwordx4 -> bound GPU buffer SPIR-V PASS");
+	}
+	{
+		const uint32_t pointer[] {0x200004, 0};
+		auto code = Gcn::BufferPixelFixture(4);
+		code[0] &= ~(8u << 22);
+		code.insert(code.begin(), 0xbf820000u);
+		std::vector<uint32_t> words;
+		Gcn::BufferDescriptor resource;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, pointer, 0, &resource), error);
+		Check(resource.address == 0x200014 && resource.size == 16, "body S_LOAD exact range");
+		Check(validator.Validate(words), "body S_LOAD SPIR-V");
+		std::ofstream file(folder / "gcn-raw-load.frag.spv", std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write body S_LOAD SPIR-V");
+		code.insert(code.begin(), 0xbe800380u); // Mutable base must not use a stale snapshot.
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, pointer, 0, &resource),
+		      "body S_LOAD accepted a mutable base");
+	}
+	{
+		const uint32_t users[] {0x200004, 0, 0};
+		auto code = Gcn::BufferPixelFixture(4);
+		code[0] = 0xc0820008u; // Load RGBA using the byte offset in s8.
+		code.insert(code.begin(), {0xc0040002u, 0xbf8c007fu}); // Load s8 using s2.
+		std::vector<uint32_t> words;
+		Gcn::BufferDescriptor resource;
+		const auto memory = [&](uint64_t address, std::span<uint8_t> out) {
+			return address == users[0] && out.size() <= 32;
+		};
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, users, 0, &resource,
+		                   {}, false, nullptr, nullptr, memory), error);
+		Check(resource.address == users[0] && resource.size == 32, "SGPR S_LOAD range");
+		Check(validator.Validate(words), "SGPR S_LOAD SPIR-V");
+		std::ofstream file(folder / "gcn-raw-sgpr.frag.spv", std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write SGPR S_LOAD SPIR-V");
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, users, 0, &resource),
+		      "SGPR S_LOAD accepted without a readable range");
+	}
+	{
+		const uint32_t users[] {0x200000, 0, 0};
+		const uint32_t code[] {0xc0040002u, 0xbf8c007fu, 0xc0880008u, 0xbf8c007fu,
+		    0x7e000280u, 0xe0382000u, 0x80040100u, 0xbf8c0f70u,
+		    0xf800180fu, 0x04030201u, 0xbf810000u};
+		const uint32_t table[] {16, 0, 0, 0,
+		    0x210000, 16u << 16, 1, 0xfac, 0x220000, 16u << 16, 1, 0xfac,
+		    0x230000, 16u << 16, 1, 0xfac, 0x240000, 16u << 16, 1, 0xfac};
+		const auto memory = [&](uint64_t address, std::span<uint8_t> out) {
+			if (address != users[0] || out.size() > sizeof(table)) return false;
+			std::memcpy(out.data(), table, out.size());
+			return true;
+		};
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> resources;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, users, 0, nullptr,
+		                   {}, false, &resources, nullptr, memory), error);
+		Check(resources.size() == 5 && resources[0].address == users[0] &&
+		          resources[1].address == table[4] && resources[2].address == table[8] &&
+		          resources[3].address == table[12] && resources[4].address == table[16],
+		      "dynamic MUBUF candidate ordering");
+		Check(validator.Validate(words), "dynamic MUBUF SPIR-V");
+		std::ofstream file(folder / "gcn-mubuf-table.frag.spv", std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write dynamic MUBUF shader");
+		std::vector<uint32_t> joined {code[0], code[1], 0xbe8903a0u, 0xbf069008u,
+		    0xbf840002u, code[2], 0xbf820001u, 0xc0880009u};
+		joined.insert(joined.end(), std::begin(code) + 3, std::end(code));
+		Check(Gcn::Compile(joined, Gcn::Stage::Pixel, words, error, users, 0, nullptr,
+		                   {}, false, &resources, nullptr, memory), error);
+		Check(resources.size() == 5 && validator.Validate(words), "MUBUF descriptor CFG join");
+		std::ofstream join_file(folder / "gcn-mubuf-join.frag.spv", std::ios::binary);
+		join_file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(join_file), "write MUBUF descriptor CFG join shader");
+		joined.insert(joined.begin() + 8, 0xbe900380u);
+		Check(!Gcn::Compile(joined, Gcn::Stage::Pixel, words, error, users, 0, nullptr,
+		                    {}, false, &resources, nullptr, memory) &&
+		          error.find("full S_LOAD") != std::string::npos,
+		      "MUBUF descriptor join accepted partial overwrite");
+		// Accumulate red from both iterations in v5 and export the final GBA.
+		const uint32_t loop[] {code[0], code[1], code[2], code[3], code[4], 0x7e0a0280u,
+		    code[5], code[6], code[7], 0x060a0b01u, 0xbf06a008u, 0xbf850004u,
+		    0xbe8803a0u, code[2], code[3], 0xbf82fff6u, code[8], 0x04030205u, code[10]};
+		Check(Gcn::Compile(loop, Gcn::Stage::Pixel, words, error, users, 0, nullptr,
+		                   {}, false, &resources, nullptr, memory), error);
+		Check(resources.size() == 5 && validator.Validate(words), "MUBUF descriptor loop backedge");
+		std::ofstream loop_file(folder / "gcn-mubuf-loop.frag.spv", std::ios::binary);
+		loop_file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(loop_file), "write MUBUF descriptor loop shader");
+	}
+	{
+		const uint32_t users[] {0x200000, 0, 0, 0, 0x200000, 4u << 16, 12, 0xfac};
+		const uint32_t code[] {0x7e000280u, 0x7e0a02a0u, 0xe0702000u, 0x80010500u,
+		    0xbf8c0f70u, 0xc0040002u, 0xbf8c007fu, 0xc0880008u, 0xbf8c007fu,
+		    0xe0382000u, 0x80040100u, 0xbf8c0f70u, 0xf800180fu, 0x04030201u, 0xbf810000u};
+		const uint32_t table[] {16, 0, 0, 0,
+		    0x210000, 16u << 16, 1, 0xfac, 0x220000, 16u << 16, 1, 0xfac};
+		const auto memory = [&](uint64_t address, std::span<uint8_t> out) {
+			if (address != users[0] || out.size() > sizeof(table)) return false;
+			std::memcpy(out.data(), table, out.size());
+			return true;
+		};
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> buffers;
+		std::vector<Gcn::ImageDescriptor> images;
+		uint32_t writable = 0;
+		Check(Gcn::CompileImages(code, Gcn::Stage::Pixel, words, error, users, 0, {},
+		                         false, buffers, images, memory, nullptr, nullptr, nullptr, &writable), error);
+		Check(buffers.size() == 3 && buffers[0].address == users[0] && writable == 1 &&
+		          validator.Validate(words), "writable SRT shares the store and SMRD binding");
+		std::ofstream file(folder / "gcn-srt-store.frag.spv", std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write GCN SRT store shader");
+	}
+	for (bool vertex : {false, true}) {
+		const uint32_t users[] {0x200000, 0};
+		std::array<uint32_t, 32> table {};
+		std::vector<uint32_t> prefix {0xc1040100u, 0xc10c0110u, 0xbf8c007fu};
+		for (uint32_t i = 0; i < 8; ++i) {
+			table[4 * i] = 0x210000 + i * 0x1000;
+			table[4 * i + 2] = 16;
+			table[4 * i + 3] = 0xfac;
+			prefix.push_back(0xc2000100u | ((40u + i) << 15) | ((4u + i * 2) << 9));
+		}
+		prefix.push_back(0xbf8c007fu);
+		auto code = vertex ? Gcn::TriangleVertexFixture(false) : std::vector<uint32_t> {
+		    0x7e0202f0u, 0x7e0402ffu, std::bit_cast<uint32_t>(.75f), 0x7e0602f2u,
+		    0xf800180fu, 0x03020100u, 0xbf810000u};
+		const uint32_t dst = vertex ? 5 : 0;
+		std::vector<uint32_t> sum {0x7e000200u | (dst << 17) | 40u};
+		for (uint32_t i = 1; i < 8; ++i)
+			sum.push_back(0x06000000u | (dst << 17) | (dst << 9) | (40u + i));
+		code.insert(code.end() - 3, sum.begin(), sum.end());
+		code.insert(code.begin(), prefix.begin(), prefix.end());
+		const auto memory = [&](uint64_t address, std::span<uint8_t> out) {
+			if (address < users[0] || address - users[0] > sizeof(table) ||
+			    out.size() > sizeof(table) - (address - users[0])) return false;
+			std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(table.data()) + (address - users[0]), out.size());
+			return true;
+		};
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> buffers;
+		std::vector<Gcn::ImageDescriptor> images;
+		Check(Gcn::CompileImages(code, vertex ? Gcn::Stage::Vertex : Gcn::Stage::Pixel,
+		                         words, error, users, 0, {}, false, buffers, images, memory), error);
+		Check(buffers.size() == 8 && buffers.back().address == table[28] &&
+		          validator.Validate(words), "eight buffers per GCN stage");
+		std::ofstream file(folder / (vertex ? "gcn-eight.vert.spv" : "gcn-eight.frag.spv"), std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write eight-buffer shader");
+	}
+	for (bool sampled : {false, true}) {
+		const uint32_t users[] {0x200000, 0, 0, 0, 0x92, 0, 0, 0};
+		const uint32_t code[] {0xc0040002u, 0xbf8c007fu, 0xc0c80008u, 0xbf8c007fu,
+		    0x7e140280u, 0x7e160280u, 0x7e180280u,
+		    sampled ? 0xf0900f00u : 0xf0001f00u, sampled ? 0x0024040au : 0x0004040au,
+		    0xbf8c0f70u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+		const uint32_t table[] {16, 0, 0, 0,
+		    0x2100, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2200, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2300, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2400, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0};
+		const auto memory = [&](uint64_t address, std::span<uint8_t> out) {
+			if (address != users[0] || out.size() > sizeof(table)) return false;
+			std::memcpy(out.data(), table, out.size());
+			return true;
+		};
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> buffers;
+		std::vector<Gcn::ImageDescriptor> images;
+		Check(Gcn::CompileImages(code, Gcn::Stage::Pixel, words, error, users, 0, {},
+		                         false, buffers, images, memory), error);
+		Check(buffers.size() == 1 && images.size() == 4 &&
+		          images[0].address == 0x210000 && images[1].address == 0x220000 &&
+		          images[2].address == 0x230000 && images[3].address == 0x240000 &&
+		          validator.Validate(words), "dynamic MIMG candidate order and SPIR-V");
+		std::ofstream file(folder / (sampled ? "gcn-image-srt-sample.frag.spv" : "gcn-image-srt-load.frag.spv"),
+		                   std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write dynamic MIMG shader");
+	}
+	for (bool vertex : {false, true}) {
+		const uint32_t users[] {
+		    0x2200, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2300, 10u << 20, 1, 0x90800facu, 63u << 13, 0, 0, 0};
+		auto code = vertex ? Gcn::TriangleVertexFixture(false) : std::vector<uint32_t> {
+		    0xf800180fu, 0x07061704u, 0xbf810000u}; // R, B and A from first, G from second.
+		code.insert(code.end() - 3, {0x7e140280u, 0x7e160280u, 0xf0001f00u,
+		    vertex ? 0x00000c0au : 0x0000040au,
+		    vertex ? 0x7e140280u : 0x7e140281u, 0xf0001f00u, 0x0002160au, 0xbf8c0f70u});
+		if (vertex)
+			code.insert(code.end() - 3, {0x7e0a030cu, 0x060a0b16u});
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> buffers;
+		std::vector<Gcn::ImageDescriptor> images;
+		Check(Gcn::CompileImages(code, vertex ? Gcn::Stage::Vertex : Gcn::Stage::Pixel,
+		                         words, error, users, 0, {}, false, buffers, images), error);
+		Check(images.size() == 2 && images[0].width == 1 && images[1].width == 2 &&
+		          validator.Validate(words), "two images per GCN stage");
+		std::ofstream file(folder / (vertex ? "gcn-two-images.vert.spv" : "gcn-two-images.frag.spv"), std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write two-image shader");
+	}
+	for (bool vertex : {false, true}) {
+		const uint32_t users[] {
+		    0x200000, 0, 16, 0xfac, 0x210000, 0, 16, 0xfac, 0x220000, 0, 16, 0xfac};
+		auto code = vertex ? Gcn::TriangleVertexFixture(false) : Gcn::SolidPixelFixture();
+		if (vertex) {
+			code.insert(code.end() - 3, {0x7e0a0210u, 0x060a0a11u, 0x060a0a12u});
+		} else {
+			code = {0x7e000210u, 0x7e020211u, 0x7e040212u, 0x7e0602f2u,
+			        0xf800180fu, 0x03020100u, 0xbf810000u};
+		}
+		code.insert(code.begin(), {0xc2080100u, 0xc2088500u, 0xc2090900u, 0xbf8c007fu});
+		std::vector<uint32_t> words;
+		std::vector<Gcn::BufferDescriptor> resources;
+		Check(Gcn::Compile(code, vertex ? Gcn::Stage::Vertex : Gcn::Stage::Pixel, words,
+		                   error, users, 0, nullptr, {}, false, &resources), error);
+		Check(resources.size() == 3 && resources[0].address == users[0] &&
+		          resources[1].address == users[4] && resources[2].address == users[8],
+		      "three GCN buffers in descriptor order");
+		Check(validator.Validate(words), "three GCN buffers SPIR-V");
+		std::ofstream file(folder / (vertex ? "gcn-three.vert.spv" : "gcn-three.frag.spv"), std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write three-buffer shader");
+	}
+	for (uint32_t width : {1u, 2u}) {
+		const uint32_t pointer[] {0x200004, 0};
+		auto code = Gcn::BufferPixelFixture(4);
+		code[0] = 0xc0020104u | ((width - 1) << 22);
+		code[3] = width == 1 ? 0x7e0202f0u : code[3]; // .5 when only red comes from memory.
+		code[4] = 0x7e0402f0u; // Blue = .5.
+		code[5] = 0x7e0602f2u; // Alpha = 1.
+		code.insert(code.begin(), 0xbf820000u);
+		std::vector<uint32_t> words;
+		Gcn::BufferDescriptor resource;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, pointer, 0, &resource), error);
+		Check(resource.address == 0x200014 && resource.size == width * 4, "short S_LOAD exact range");
+		Check(validator.Validate(words), "short S_LOAD SPIR-V");
+		std::ofstream file(folder / ("gcn-raw-short" + std::to_string(width) + ".frag.spv"), std::ios::binary);
+		file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+		Check(bool(file), "write short S_LOAD SPIR-V");
 	}
 	{
 		const uint32_t flat[] {0x400};
@@ -413,7 +655,7 @@ int main(int argc, char** argv) {
 		reject_mask(bad);
 		bad = Gcn::MaskedPixelFixture();
 		for (size_t i = 0; i < bad.size(); ++i) if (bad[i] == 0xbe90246au) {
-			bad.insert(bad.begin() + i + 1, 0xbf820000u); // branch inside reduced EXEC
+			bad.insert(bad.begin() + i + 1, 0xbf820003u); // skip the restore and reach the export
 			break;
 		}
 		reject_mask(bad);
@@ -453,18 +695,14 @@ int main(int argc, char** argv) {
 		auto bad = Gcn::ElsePixelFixture();
 		for (auto& word: bad) if (word == 0x89fe7e10u) word = 0x89fe7e12u;
 		reject_else(bad); // different saved pair
-		bad = Gcn::ElsePixelFixture(false);
-		for (size_t i = 0; i < bad.size(); ++i) if (bad[i] == 0x89fe7e10u) {
-			bad.insert(bad.begin() + i + 1, bad[i]);
-			break;
-		}
-		reject_else(bad); // second complement in the same frame
 		bad = Gcn::ElsePixelFixture();
 		for (auto& word: bad) if ((word & 0xffff0000u) == 0xbf880000u) { word = 0xbf880001u; break; }
 		reject_else(bad); // guard targets the literal of a VALU instruction
 		bad = Gcn::ElsePixelFixture(false, true);
 		for (auto& word: bad) if (word == 0x89fe7e12u) word = 0x89fe7e10u;
-		reject_else(bad); // nested else uses parent frame
+		std::vector<uint32_t> words;
+		Check(Gcn::Compile(bad, Gcn::Stage::Pixel, words, error, {}, 1), error);
+		Check(validator.Validate(words), "nested XOR can read the parent's saved EXEC");
 	}
 	{
 		for (uint32_t mode = 0; mode < 7; ++mode) {
@@ -738,6 +976,50 @@ int main(int argc, char** argv) {
 			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
 			          error.find("requires restored EXEC") != std::string::npos, "unrestored second exit");
 		}
+		for (uint32_t exit = 0; exit < 2; ++exit) {
+			auto code = Gcn::MaskedPixelFixture(false, false);
+			const auto restore = std::find(code.begin(), code.end(), 0xbefe0410u);
+			Check(restore != code.end(), "saved-frame fixture restore");
+			code.erase(restore, code.end());
+			const auto save = std::find(code.begin(), code.end(), 0xbe90246au);
+			Check(save != code.end(), "saved-frame fixture save");
+			*save = exit ? 0xbe902614u : 0xbe902414u;
+			// XOR needs EXEC ^ VCC as its source to select the same lanes as AND.
+			code.insert(save, exit ? 0x89947e6au : 0xbe94046au);
+			const auto masked_write = code.end() - 2;
+			// The fallthrough writes the complementary lanes, then recovers the
+			// original active lanes before joining the path that skips both XORs.
+			code.insert(masked_write, {0xbe920380u | exit, 0xbf078012u, 0xbf850004u,
+			                           0x89fe7e10u, 0x7e0402ffu, std::bit_cast<uint32_t>(.875f),
+			                           0x89fe7e10u});
+			// Select a wave-uniform path with SCC while the divergent EXEC is saved.
+			// The fallthrough arm jumps past the taken arm's exit.
+			code.insert(code.end(), {0xbf078012u, 0xbf850001u, 0xbf820006u});
+			for (float blue : {.625f, .375f}) {
+				code.insert(code.end(), {0xbefe0410u,
+				                         0x7e0802ffu, std::bit_cast<uint32_t>(blue),
+				                         0xf800180fu, 0x05040302u, 0xbf810000u});
+			}
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "divergent saved-frame branches SPIR-V");
+			// Keep the same pixel oracle and exercise these branches in the GPU runner.
+			std::ofstream file(folder / ("gcn-cfg-frame" + std::to_string(exit) + ".frag.spv"), std::ios::binary);
+			file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+			Check(bool(file), "write saved-frame branch fixture");
+			code[code.size() - 6] = 0xbf800000u;
+			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find("requires restored EXEC") != std::string::npos, "unrestored saved-frame exit");
+		}
+		for (uint32_t op = 36; op <= 43; ++op) {
+			auto code = Gcn::MaskedPixelFixture(false, false);
+			const auto save = std::find(code.begin(), code.end(), 0xbe90246au);
+			Check(save != code.end(), "SAVEEXEC predicate fixture");
+			*save = 0xbe90006au | (op << 8);
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "SAVEEXEC predicate SPIR-V");
+		}
 	}
 	// Indirect immutable table snapshots: only two user SGPRs, but two buffers,
 	// image and sampler in both stages. Prepared, not executed during integration.
@@ -896,7 +1178,7 @@ int main(int argc, char** argv) {
 					reject_load((load & ~(127u << 15)) | (103u << 15));
 					// One DWORD fits s103; rejection above also follows from
 					// undefined s16 in the consumer. Wider loads exceed s103.
-					reject_load(load & ~0x100u); // dynamic offset remains unsupported
+					reject_load((load & ~0x1ffu) | 32u); // s32 is undefined before the load
 				}
 		std::puts("PS4_GCN SMRD five widths, VS/PS, two descriptor slots PASS");
 	}
@@ -923,7 +1205,7 @@ int main(int argc, char** argv) {
 		};
 		reject_buffer(Gcn::BufferPixelFixture(16), descriptor);
 		reject_buffer(Gcn::BufferPixelFixture(), std::span(descriptor).first(3));
-		for (uint32_t mask: {0x100u, 0x200u, 15u << 22}) {
+		for (uint32_t mask: {0x200u, 15u << 22}) {
 			auto code = Gcn::BufferPixelFixture();
 			code[0] ^= mask;
 			reject_buffer(code, descriptor);
@@ -1038,6 +1320,21 @@ int main(int argc, char** argv) {
 		for (uint32_t mask: {1u << 21, 1u << 22, 1u << 23, 1u << 24, 2u << 16}) {
 			auto code = Gcn::IndexedBufferPixelFixture();
 			code[4] ^= mask;
+			reject_indexed(code, {std::begin(ps_users), std::end(ps_users)});
+		}
+		{
+			auto code = Gcn::IndexedBufferPixelFixture();
+			code[2] = 0x7e000280u; // v0 = 0, index stays fixed.
+			code[4] = (code[4] & 0xffffffu) | (8u << 24); // s8 supplies SOFFSET.
+			std::vector<uint32_t> words;
+			std::vector<Gcn::BufferDescriptor> resources;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, ps_users, 0,
+			                   nullptr, {}, false, &resources), error);
+			Check(resources.size() == 2 && validator.Validate(words), "MUBUF SOFFSET SPIR-V");
+			std::ofstream file(folder / "gcn-mubuf-soffset.frag.spv", std::ios::binary);
+			file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+			Check(bool(file), "write MUBUF SOFFSET shader");
+			code[4] = (code[4] & 0xffffffu) | (12u << 24);
 			reject_indexed(code, {std::begin(ps_users), std::end(ps_users)});
 		}
 		for (const auto& change: std::vector<std::pair<uint32_t, uint32_t>> {{5, 0},

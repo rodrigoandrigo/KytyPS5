@@ -758,6 +758,12 @@ enum class Opcode {
 	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
+	S_OR_SAVEEXEC_B64,
+	S_XOR_SAVEEXEC_B64,
+	S_ANDN2_SAVEEXEC_B64,
+	S_NAND_SAVEEXEC_B64,
+	S_NOR_SAVEEXEC_B64,
+	S_XNOR_SAVEEXEC_B64,
 	COUNT
 };
 
@@ -867,8 +873,14 @@ struct Instruction {
 	uint32_t       image_sample_flags                           = 0;
 	ImageDimension image_dimension                              = ImageDimension::Unknown;
 	uint32_t       image_address_components                     = 0;
-	uint32_t       image_nsa_dwords                             = 0;
-	uint32_t       image_nsa_addr[MaxImageNsaAddressComponents] = {};
+	uint32_t       image_nsa_dwords                             = 0; // Candidate count for normalized GCN MUBUF.
+	union {
+		uint32_t image_nsa_addr[MaxImageNsaAddressComponents] = {};
+		// Compiler-only metadata for MUBUF. Decoded MUBUF leaves this storage zero.
+		uint32_t gcn_buffer_candidates[4][3]; // Fourth word is the fixed raw/identity format.
+		// GCN linear RGBA8 candidates store the three variable descriptor words.
+		uint32_t gcn_image_candidates[4][3];
+	};
 	uint32_t       memory_segment                               = 0;
 	bool           data_signed                                  = false;
 	bool           typed                                        = false;

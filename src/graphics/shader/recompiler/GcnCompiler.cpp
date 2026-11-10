@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/GcnCompiler.h"
+#include "graphics/guest_gpu/ps4Raster.h"
 
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
@@ -69,6 +70,31 @@ bool DecodeImageDescriptor(std::span<const uint32_t> w, ImageDescriptor& out, st
 }
 
 namespace {
+// GNM holds its mapping lease across probing, snapshotting and submission.
+// Probe at most one buffer's worth, without repeatedly copying its valid prefix.
+uint32_t ReadableScalarBufferSize(const ShaderMemory& memory, uint64_t base, uint32_t limit) {
+	if (!memory) return 0;
+	std::array<uint8_t, 4096> scratch;
+	uint32_t size = 0;
+	while (size < limit) {
+		const uint32_t chunk = std::min(limit - size, uint32_t(scratch.size()));
+		if (memory(base + size, std::span(scratch).first(chunk))) {
+			size += chunk;
+			continue;
+		}
+		uint32_t low = 0, high = chunk / 4;
+		while (high - low > 1) {
+			const uint32_t mid = low + (high - low) / 2;
+			if (memory(base + size, std::span(scratch).first(mid * 4)))
+				low = mid;
+			else
+				high = mid;
+		}
+		return size + low * 4;
+	}
+	return size;
+}
+
 struct FrozenScalars {
 	std::array<std::optional<uint32_t>, 104> values {};
 	std::vector<ScalarRead> reads;
@@ -187,11 +213,11 @@ bool FreezeScalarPrelude(std::span<const uint32_t> code, std::span<const uint32_
 			++first_body;
 			break; // Exactly one initial fetch call, before VS control flow.
 		}
-		if ((word & 0xf8000000u) != 0xc0000000u || op > 4) break;
+		if ((word & 0xf8000100u) != 0xc0000100u || op > 4) break;
 		const uint32_t base = ((word >> 9) & 63) * 2, dst = (word >> 15) & 127;
 		const uint32_t count = 1u << op;
 		std::array<uint32_t, 2> pointer;
-		if (!(word & 0x100) || dst + count > 104 || !memory ||
+		if (dst + count > 104 || !memory ||
 		    !frozen.Words(base, pointer, error)) {
 			if (error.empty()) error = "S_LOAD prelude requires immutable pointer and memory reader";
 			return false;
@@ -258,12 +284,12 @@ bool CanonicalResources(std::vector<uint32_t>& code, Stage stage, const IR::Prog
 		old = sets[var];
 #endif
 		if (old == native_buffer) {
-			canonical[var] = stage == Stage::Vertex ? 60 : 58;
+			canonical[var] = Ps4::BufferBinding + (stage == Stage::Vertex ? Ps4::BuffersPerStage : 0);
 			buffer_var     = var;
 		} else if (old == native_image)
-			canonical[var] = stage == Stage::Vertex ? 65 : 64;
+			canonical[var] = Ps4::ImageBinding + (stage == Stage::Vertex ? Ps4::ImagesPerStage : 0);
 		else if (old == native_sampler && !program.info.samplers.empty())
-			canonical[var] = stage == Stage::Vertex ? 67 : 66;
+			canonical[var] = Ps4::SamplerBinding + (stage == Stage::Vertex ? 1 : 0);
 		else {
 			error = "unexpected GCN resource binding";
 			return false;
@@ -276,18 +302,19 @@ bool CanonicalResources(std::vector<uint32_t>& code, Stage stage, const IR::Prog
 		if (code[i + 2] == 34) code[i + 3] = 0;
 		if (code[i + 1] == buffer_var && code[i + 2] == 24) readonly = true;
 	}
-	if (buffer_var && !readonly)
+	if (buffer_var && !readonly && IR::IsReadOnlyBufferBinding(program.info, IR::DescriptorBindingKind::Buffers))
 		code.insert(code.begin() + types, {(3u << 16) | 71u, buffer_var, 24});
 	return true;
 }
 } // namespace
 
-bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>& spirv,
+static bool CompileImpl(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>& spirv,
              std::string& error, std::span<const uint32_t> user_data, uint32_t parameter_count,
              BufferDescriptor* buffer, std::span<const uint32_t> parameter_map, bool no_perspective,
              std::vector<BufferDescriptor>* resources, ImageDescriptor* image,
              const ShaderMemory& memory, std::vector<ScalarRead>* scalar_reads,
-             std::vector<uint32_t>* normalized_code, uint32_t* scalar_registers) {
+             std::vector<uint32_t>* normalized_code, uint32_t* scalar_registers,
+             std::vector<ImageDescriptor>* images, uint32_t* writable_buffers) {
 	error.clear();
 	if (!ValidateParameterMap(parameter_map, parameter_count, error)) return false;
 	if (stage != Stage::Vertex && stage != Stage::Pixel) {
@@ -316,26 +343,29 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 		}
 	}
 	std::map<uint32_t, BufferDescriptor> by_pc;
+	std::map<uint64_t, BufferDescriptor> writable_ranges;
+	std::vector<Decoder::Instruction*> dynamic_mubuf;
+	std::vector<Decoder::Instruction*> dynamic_images;
+	std::map<uint64_t, uint32_t>         scalar_buffer_sizes;
 	std::bitset<104>                     descriptor_mask;
-	ImageDescriptor                      image_descriptor;
+	std::map<uint32_t, ImageDescriptor>  image_by_pc;
 	bool                                 uses_image = false, uses_sampler = false;
-	for (const auto& inst: decoded.instructions) {
+	for (auto& inst: decoded.instructions) {
 		if (inst.family == Decoder::Family::MIMG) {
 			std::array<uint32_t, 8> words;
 			ImageDescriptor current;
-			if (!image || !frozen.Words(inst.src1.reg, words, error) ||
-			    !DecodeImageDescriptor(words, current, error)) {
-				if (error.empty()) error = "image instruction requires descriptor output";
+			if (!image && !images) {
+				error = "image instruction requires descriptor output";
 				return false;
 			}
-			if (uses_image && (current.address != image_descriptor.address ||
-			                   current.width != image_descriptor.width ||
-			                   current.height != image_descriptor.height ||
-			                   current.pitch != image_descriptor.pitch)) {
-				error = "multiple different GCN images require a resource list ABI";
-				return false;
+			if (frozen.Words(inst.src1.reg, words, error)) {
+				if (!DecodeImageDescriptor(words, current, error)) return false;
+				image_by_pc.emplace(inst.pc, current);
+				for (uint32_t n = 0; n < 8; ++n) descriptor_mask.set(inst.src1.reg + n);
+			} else {
+				if (!images) return false;
+				dynamic_images.push_back(&inst);
 			}
-			image_descriptor = current;
 			if (inst.opcode == Decoder::Opcode::IMAGE_SAMPLE) {
 				std::array<uint32_t, 4> sampler;
 				if (!frozen.Words(inst.src2.reg, sampler, error)) return false;
@@ -347,19 +377,71 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 				for (uint32_t n = 0; n < 4; ++n) descriptor_mask.set(inst.src2.reg + n);
 			}
 			uses_image = true;
-			for (uint32_t n = 0; n < 8; ++n) descriptor_mask.set(inst.src1.reg + n);
 			continue;
 		}
 		const bool vector_load = inst.family == Decoder::Family::MUBUF ||
 		                         inst.family == Decoder::Family::MTBUF;
 		if (!vector_load && inst.family != Decoder::Family::SMEM) continue;
 		if (inst.family == Decoder::Family::SMEM && inst.opcode_id <= 4) {
-			error = "S_LOAD requires an initial immutable scalar prelude";
-			return false;
+			std::array<uint32_t, 2> pointer;
+			if ((!buffer && !resources) || !frozen.Words(inst.src0.reg, pointer, error)) {
+				if (error.empty()) error = "S_LOAD requires a buffer output and an immutable base";
+				return false;
+			}
+			const uint64_t base = pointer[0] | (uint64_t(pointer[1]) << 32);
+			uint32_t size = inst.data_dwords * 4u;
+			const bool dynamic = inst.src1.kind == Decoder::OperandKind::Sgpr;
+			const uint64_t offset = dynamic ? 0 : inst.src1.value;
+			constexpr uint64_t limit = 1ull << 40;
+			if (!base || base % 4 || base >= limit || offset + size > limit - base) {
+				error = "S_LOAD address outside the aligned PS4 address range";
+				return false;
+			}
+			const uint64_t address = base + offset;
+			if (dynamic) {
+				auto [entry, inserted] = scalar_buffer_sizes.try_emplace(base);
+				if (inserted)
+					entry->second = ReadableScalarBufferSize(
+					    memory, base, uint32_t(std::min<uint64_t>(65536, limit - base)));
+				size = entry->second;
+				if (!size) {
+					error = "S_LOAD SGPR offset requires a readable buffer range";
+					return false;
+				}
+			} else {
+				inst.src1.value = 0;
+			}
+			by_pc.emplace(inst.pc, BufferDescriptor {address, size, 0});
+			descriptor_mask.set(inst.src0.reg);
+			descriptor_mask.set(inst.src0.reg + 1);
+			// Lower only the decoded instruction. The normalized GCN and its
+			// guest register allocation still describe the original S_LOAD.
+			constexpr Decoder::Opcode loads[] {
+			    Decoder::Opcode::S_BUFFER_LOAD_DWORD, Decoder::Opcode::S_BUFFER_LOAD_DWORDX2,
+			    Decoder::Opcode::S_BUFFER_LOAD_DWORDX4, Decoder::Opcode::S_BUFFER_LOAD_DWORDX8,
+			    Decoder::Opcode::S_BUFFER_LOAD_DWORDX16};
+			inst.opcode = loads[inst.opcode_id];
+			inst.src0.kind = inst.src2.kind = inst.src3.kind = Decoder::OperandKind::LiteralConstant;
+			inst.src0.value = size;
+			inst.src2.value = uint32_t(address);
+			inst.src3.value = uint32_t(address >> 32);
+			inst.src_count = 4; // Internal scalar buffer form with an explicit address.
+			continue;
 		}
 		const uint32_t   base = vector_load ? inst.src1.reg : inst.src0.reg;
 		BufferDescriptor descriptor;
 		std::array<uint32_t, 4> words;
+		const bool store = inst.family == Decoder::Family::MUBUF &&
+		    inst.opcode_id >= 28 && inst.opcode_id <= 31;
+		if (store && (!writable_buffers || !frozen.Words(base, words, error))) {
+			error = "GCN store requires a writable binding and a direct descriptor";
+			return false;
+		}
+		if (inst.family == Decoder::Family::MUBUF && resources &&
+		    !frozen.Words(base, words, error)) {
+			dynamic_mubuf.push_back(&inst);
+			continue;
+		}
 		if ((!buffer && !resources) || !frozen.Words(base, words, error) ||
 		    !DecodeBufferDescriptor(words, descriptor, error, vector_load)) {
 			if (error.empty()) error = "load requires immutable direct user descriptor";
@@ -373,6 +455,138 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 		}
 		for (uint32_t n = 0; n < 4; ++n) descriptor_mask.set(base + n);
 		by_pc.emplace(inst.pc, descriptor);
+		if (store) {
+			const auto [entry, inserted] = writable_ranges.emplace(descriptor.address, descriptor);
+			if (!inserted && (entry->second.size != descriptor.size ||
+			                  entry->second.stride != descriptor.stride)) {
+				error = "conflicting writable PS4 buffer descriptors";
+				return false;
+			}
+		}
+	}
+	for (auto& inst : decoded.instructions) {
+		if (!writable_ranges.empty() && inst.opcode == Decoder::Opcode::S_WAITCNT &&
+		    inst.raw[0] == 0xbf8c0f70u)
+			inst.secondary_offset = 1;
+		if (inst.family != Decoder::Family::SMEM || inst.opcode_id > 4 ||
+		    inst.src1.kind != Decoder::OperandKind::Sgpr) continue;
+		auto& table = by_pc.at(inst.pc);
+		const auto found = writable_ranges.find(table.address);
+		if (found == writable_ranges.end()) continue;
+		const auto& buffer = found->second;
+		if (buffer.size > table.size) {
+			error = "writable SRT exceeds its readable range";
+			return false;
+		}
+		table = buffer;
+		inst.src0.value = buffer.size / buffer.stride;
+		inst.src3.value |= buffer.stride << 16;
+	}
+	// Raw loads are resolved first so a loop backedge can define a descriptor
+	// at a higher guest PC than its MUBUF use. Decode already checks definite assignment.
+	for (auto* use : dynamic_mubuf) {
+		auto& inst = *use;
+		const auto base = inst.src1.reg;
+		BufferDescriptor descriptor;
+		std::vector<BufferDescriptor> tables;
+		for (const auto& writer : decoded.instructions) {
+			if (writer.dst.kind != Decoder::OperandKind::Sgpr) continue;
+			const uint32_t count = writer.family == Decoder::Family::VOPC ? 2 : writer.data_dwords;
+			if (writer.dst.reg >= base + 4 || base >= writer.dst.reg + count) continue;
+			if (writer.dst.reg != base ||
+			    writer.family != Decoder::Family::SMEM || writer.opcode_id != 2 ||
+			    writer.src_count != 4 || writer.src1.kind != Decoder::OperandKind::Sgpr) {
+				error = "dynamic MUBUF descriptor requires full S_LOAD_DWORDX4 writes";
+				return false;
+			}
+			const auto& table = by_pc.at(writer.pc);
+			if (std::none_of(tables.begin(), tables.end(), [&](const auto& current) {
+				    return current.address == table.address && current.size == table.size;
+			    }))
+				tables.push_back(table);
+		}
+		if (tables.empty()) {
+			error = "dynamic MUBUF descriptor has no S_LOAD_DWORDX4 producer";
+			return false;
+		}
+		for (const auto& table : tables) {
+			std::vector<uint32_t> data(table.size / 4);
+			if (!memory(table.address, {reinterpret_cast<uint8_t*>(data.data()), table.size})) {
+				error = "dynamic MUBUF table unreadable";
+				return false;
+			}
+			for (size_t i = 0; i + 4 <= data.size(); ++i) {
+				const auto entry = std::span(data).subspan(i, 4);
+				std::string unsupported;
+				if (!DecodeBufferDescriptor(entry, descriptor, unsupported, true) ||
+				    inst.offset + inst.data_dwords * 4 > descriptor.stride)
+					continue;
+				bool duplicate = false;
+				for (uint32_t n = 0; n < inst.image_nsa_dwords; ++n)
+					duplicate |= std::equal(entry.begin(), entry.begin() + 3, inst.gcn_buffer_candidates[n]);
+				if (duplicate) continue;
+				if (inst.image_nsa_dwords == std::size(inst.gcn_buffer_candidates)) {
+					error = "dynamic MUBUF table exceeds supported buffer candidates";
+					return false;
+				}
+				for (uint32_t n = 0; n < 3; ++n)
+					inst.gcn_buffer_candidates[inst.image_nsa_dwords][n] = entry[n];
+				++inst.image_nsa_dwords;
+			}
+		}
+		if (!inst.image_nsa_dwords) {
+			error = "dynamic MUBUF table has no supported buffer descriptors";
+			return false;
+		}
+		error.clear();
+	}
+	for (auto* use : dynamic_images) {
+		auto& inst = *use;
+		const auto base = inst.src1.reg;
+		std::map<uint64_t, uint32_t> tables;
+		for (const auto& writer : decoded.instructions) {
+			if (writer.dst.kind != Decoder::OperandKind::Sgpr) continue;
+			const uint32_t count = writer.family == Decoder::Family::VOPC ? 2 : writer.data_dwords;
+			if (writer.dst.reg >= base + 8 || base >= writer.dst.reg + count) continue;
+			if (writer.dst.reg != base || writer.family != Decoder::Family::SMEM ||
+			    writer.opcode_id != 3 || writer.src_count != 4 ||
+			    writer.src1.kind != Decoder::OperandKind::Sgpr) {
+				error = "dynamic MIMG descriptor requires full S_LOAD_DWORDX8 writes";
+				return false;
+			}
+			const auto& table = by_pc.at(writer.pc);
+			tables.emplace(table.address, table.size);
+		}
+		for (const auto& [address, size] : tables) {
+			std::vector<uint32_t> data(size / 4);
+			if (!memory(address, {reinterpret_cast<uint8_t*>(data.data()), size})) {
+				error = "dynamic MIMG table unreadable";
+				return false;
+			}
+			for (size_t i = 0; i + 8 <= data.size(); ++i) {
+				const auto entry = std::span(data).subspan(i, 8);
+				ImageDescriptor descriptor;
+				std::string unsupported;
+				if (!DecodeImageDescriptor(entry, descriptor, unsupported)) continue;
+				const uint32_t words[] {entry[0], entry[2], entry[4]};
+				bool duplicate = false;
+				for (uint32_t n = 0; n < inst.secondary_offset; ++n)
+					duplicate |= std::equal(std::begin(words), std::end(words), inst.gcn_image_candidates[n]);
+				if (duplicate) continue;
+				if (inst.secondary_offset == std::size(inst.gcn_image_candidates)) {
+					error = "dynamic MIMG table exceeds supported image candidates";
+					return false;
+				}
+				for (uint32_t n = 0; n < 3; ++n)
+					inst.gcn_image_candidates[inst.secondary_offset][n] = words[n];
+				++inst.secondary_offset;
+			}
+		}
+		if (!inst.secondary_offset) {
+			error = "dynamic MIMG table has no supported image descriptors";
+			return false;
+		}
+		error.clear();
 	}
 	const bool uses_buffer = !by_pc.empty();
 	if (uses_buffer || uses_image)
@@ -442,16 +656,33 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 	auto                          translated = TranslateProgram(decoded, options);
 	IR::ResourceSpecialization    specialization;
 	std::vector<BufferDescriptor> descriptors;
+	uint32_t writable_mask = 0;
 	if (uses_buffer) {
 		for (const auto& resource: translated.program.info.buffers) {
 			auto found = by_pc.find(resource.first_use_pc);
-			if (found == by_pc.end() || descriptors.size() == 2) {
+			BufferDescriptor descriptor;
+			if (found != by_pc.end()) {
+				descriptor = found->second;
+			} else if (resource.source < translated.program.descriptor_sources.size()) {
+				const auto& source = translated.program.descriptor_sources[resource.source];
+				std::array<uint32_t, 4> words;
+				bool immediate = source.dword_count == words.size();
+				for (uint32_t n = 0; immediate && n < words.size(); ++n) {
+					const auto word = source.dwords[n].Resolve();
+					immediate = word.IsImmediate() && word.GetType() == IR::Type::U32;
+					if (immediate) words[n] = word.U32();
+				}
+				if (!immediate || !DecodeBufferDescriptor(words, descriptor, error, true))
+					return false;
+			}
+			if (!descriptor.size || descriptors.size() == Ps4::BuffersPerStage) {
 				error = "unexpected GCN resource origin/count";
 				return false;
 			}
-			descriptors.push_back(found->second);
+			if (resource.written) writable_mask |= 1u << descriptors.size();
+			descriptors.push_back(descriptor);
 			IR::ResourceSpecialization::Buffer value;
-			value.packed_stride = found->second.stride;
+			value.packed_stride = descriptor.stride;
 			specialization.buffers.push_back(value);
 		}
 		if (descriptors.empty() || (descriptors.size() > 1 && !resources)) {
@@ -465,7 +696,11 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 				if (it->GetOpcode() != IR::ValueOpcode::LoadBufferU32 &&
 				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x2 &&
 				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x3 &&
-				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x4)
+				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x4 &&
+				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32 &&
+				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x2 &&
+				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x3 &&
+				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x4)
 					continue;
 				const auto& memory =
 				    translated.program.memory_info[it->Flags<IR::MemoryFlags>().index];
@@ -478,20 +713,57 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
                     it, IR::ValueOpcode::UMin32,
                     {it->Arg(1), IR::Value(descriptor.size / descriptor.stride)});
 				it->SetArg(1, IR::Value(&*safe));
+				if (it->Arg(3).Resolve() != IR::Value(0u)) {
+					const auto offset = block->PrependNewInst(
+					    it, IR::ValueOpcode::UMin32, {it->Arg(3), IR::Value(descriptor.size)});
+					it->SetArg(3, IR::Value(&*offset));
+				}
 			}
 	}
+	std::vector<ImageDescriptor> image_descriptors;
 	if (uses_image) {
-		if (translated.program.info.images.size() != 1) {
+		const auto& image_resources = translated.program.info.images;
+		if (image_resources.empty() || image_resources.size() > (images ? Ps4::ImagesPerStage : 1u)) {
 			error = "unexpected GCN image count";
 			return false;
 		}
 		IR::ResourceSpecialization::Image value;
 		value.numeric_class = Prospero::TextureNumericClass::Float;
 		value.dimension     = Decoder::ImageDimension::Dim2D;
-		specialization.images.push_back(value);
+		for (const auto& resource : image_resources) {
+			const auto found = image_by_pc.find(resource.first_use_pc);
+			ImageDescriptor descriptor;
+			if (found != image_by_pc.end()) {
+				descriptor = found->second;
+			} else {
+				const auto& source = translated.program.descriptor_sources.at(resource.source);
+				std::array<uint32_t, 8> words;
+				if (source.dword_count != words.size()) {
+					error = "unexpected GCN image descriptor width";
+					return false;
+				}
+				for (uint32_t n = 0; n < words.size(); ++n) {
+					const auto word = source.dwords[n].Resolve();
+					if (!word.IsImmediate() || word.GetType() != IR::Type::U32) {
+						error = "unexpected GCN image source";
+						return false;
+					}
+					words[n] = word.U32();
+				}
+				if (!DecodeImageDescriptor(words, descriptor, error)) return false;
+			}
+			image_descriptors.push_back(descriptor);
+			specialization.images.push_back(value);
+		}
 		for (auto* block: translated.program.blocks)
 			for (auto it = block->begin(); it != block->end(); ++it) {
 				if (it->GetOpcode() != IR::ValueOpcode::ImageRead) continue;
+				const auto index = translated.program.memory_info[it->Flags<IR::MemoryFlags>().index].resource;
+				if (index >= image_descriptors.size()) {
+					error = "invalid GCN image resource index";
+					return false;
+				}
+				const auto& image_descriptor = image_descriptors[index];
 				const auto* address = it->Arg(1).ResolveInstruction();
 				const auto  x =
 				    block->PrependNewInst(it, IR::ValueOpcode::ULessThan32,
@@ -515,7 +787,7 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 		specialization.unnormalized_samplers.push_back(0);
 	}
 	auto result = CompileProgram(std::move(translated), options, specialization,
-	                             stage == Stage::Vertex ? 4 : 0);
+	                             stage == Stage::Vertex ? Ps4::BufferMetadataDwords : 0);
 	if (uses_buffer || uses_image) {
 		uint64_t mask = uses_buffer ? 1 : 0;
 		if (uses_sampler) mask |= uint64_t(1) << uint32_t(IR::DescriptorBindingKind::Samplers);
@@ -523,7 +795,8 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 			mask |= uint64_t(1) << uint32_t(
 			            *IR::DescriptorBindingForImage(result.program.info.images[0]));
 		if (result.program.bindings.descriptor_mask != mask ||
-		    (uses_buffer && (result.program.bindings.ShaderDataDwords() != descriptors.size() + 1 ||
+		    (uses_buffer && (result.program.bindings.ShaderDataDwords() !=
+		                         descriptors.size() + (descriptors.size() + 3) / 4 ||
 		                     !result.program.bindings.UsesPushData()))) {
 			error = "unsupported GCN resource ABI";
 			return false;
@@ -537,7 +810,30 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 	spirv = std::move(result.spirv);
 	if (buffer) *buffer = descriptors.empty() ? BufferDescriptor {} : descriptors.front();
 	if (resources) *resources = std::move(descriptors);
-	if (image) *image = image_descriptor;
+	if (image) *image = image_descriptors.empty() ? ImageDescriptor {} : image_descriptors.front();
+	if (images) *images = std::move(image_descriptors);
+	if (writable_buffers) *writable_buffers = writable_mask;
 	return true;
+}
+bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>& spirv,
+             std::string& error, std::span<const uint32_t> user_data, uint32_t parameter_count,
+             BufferDescriptor* buffer, std::span<const uint32_t> parameter_map, bool no_perspective,
+             std::vector<BufferDescriptor>* resources, ImageDescriptor* image,
+             const ShaderMemory& memory, std::vector<ScalarRead>* scalar_reads,
+             std::vector<uint32_t>* normalized_code, uint32_t* scalar_registers) {
+	return CompileImpl(code, stage, spirv, error, user_data, parameter_count, buffer, parameter_map,
+	                   no_perspective, resources, image, memory, scalar_reads, normalized_code,
+	                   scalar_registers, nullptr, nullptr);
+}
+bool CompileImages(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>& spirv,
+                   std::string& error, std::span<const uint32_t> user_data, uint32_t parameter_count,
+                   std::span<const uint32_t> parameter_map, bool no_perspective,
+                   std::vector<BufferDescriptor>& resources, std::vector<ImageDescriptor>& images,
+                   const ShaderMemory& memory, std::vector<ScalarRead>* scalar_reads,
+                   std::vector<uint32_t>* normalized_code, uint32_t* scalar_registers,
+                   uint32_t* writable_buffers) {
+	return CompileImpl(code, stage, spirv, error, user_data, parameter_count, nullptr, parameter_map,
+	                   no_perspective, &resources, nullptr, memory, scalar_reads, normalized_code,
+	                   scalar_registers, &images, writable_buffers);
 }
 } // namespace Libs::Graphics::ShaderRecompiler::Gcn

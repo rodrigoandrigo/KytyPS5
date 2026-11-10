@@ -44,12 +44,15 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 }
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
+                            bool negate_exec, bool negate_source, bool write_64, bool negate_result) {
+	const auto bit_operation = operation == IR::ValueOpcode::LogicalAnd ? IR::ValueOpcode::BitwiseAnd32
+	                         : operation == IR::ValueOpcode::LogicalOr ? IR::ValueOpcode::BitwiseOr32
+	                                                                   : IR::ValueOpcode::BitwiseXor32;
 	const auto combine = [&](IR::U32 old, IR::U32 src) {
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
-		                                                : ir.BitwiseOr(lhs, rhs);
+		const auto result = IR::U32(ir.Emit(bit_operation, {lhs, rhs}));
+		return negate_result ? ir.BitwiseNot(result) : result;
 	};
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
@@ -70,8 +73,9 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
 	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
 	WriteMask(inst.dst, old, old_mask, true);
-	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
-	          mask);
+	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo),
+	          negate_result ? ir.LogicalNot(result) : result, mask);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 

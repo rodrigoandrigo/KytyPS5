@@ -37,16 +37,23 @@ struct Operation {
 	std::vector<ShaderRecompiler::Gcn::ScalarRead> scalar_reads;
 	uint64_t index_address = 0;
 	std::vector<uint8_t> indices;
-	uint64_t             buffer_address = 0, buffer_address2 = 0;
-	std::vector<uint8_t> pixel_buffer, pixel_buffer2;
-	uint64_t             vertex_address = 0, vertex_address2 = 0;
-	std::vector<uint8_t> vertex_buffer, vertex_buffer2, pixel_texels, vertex_texels;
-	ShaderRecompiler::Gcn::ImageDescriptor pixel_image, vertex_image;
+	struct BufferSnapshot {
+		uint64_t address = 0;
+		std::vector<uint8_t> bytes;
+		bool writable = false;
+	};
+	std::array<BufferSnapshot, Graphics::Ps4::BuffersPerStage> pixel_buffers, vertex_buffers;
+	struct ImageSnapshot {
+		ShaderRecompiler::Gcn::ImageDescriptor descriptor;
+		std::vector<uint8_t> pixels;
+	};
+	std::array<ImageSnapshot, Graphics::Ps4::ImagesPerStage> pixel_images, vertex_images;
 	uint64_t                               target;
 	Graphics::Ps4::RasterState             raster;
 	std::vector<uint32_t>                  vertex, pixel;
-	std::vector<uint32_t>                  transfer_packet;
 	Graphics::Ps4::TransferPlan            transfer;
+	bool resource_transfer = false;
+	bool observed_by_draw = false;
 };
 bool Read(const GnmMemory& memory, uint64_t address, std::span<uint8_t> bytes) {
 	return address && bytes.size() <= MaxBytes && address <= UINT64_MAX - bytes.size() &&
@@ -107,7 +114,8 @@ bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> us
 			return false;
 		}
 		if (inst.family == ShaderRecompiler::Decoder::Family::SMEM &&
-		    (inst.dst.reg + inst.data_dwords > scalars || inst.src0.reg + 4 > scalars)) {
+		    (inst.dst.reg + inst.data_dwords > scalars ||
+		     inst.src0.reg + (inst.opcode_id <= 4 ? 2u : 4u) > scalars)) {
 			error = "SMRD descriptor/destination group exceeds declared SGPR allocation";
 			return false;
 		}
@@ -117,9 +125,8 @@ bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> us
 			const bool paired =
 			    (inst.data_dwords == 2 &&
 			     (inst.family == ShaderRecompiler::Decoder::Family::SOP2 ||
-			      inst.family == ShaderRecompiler::Decoder::Family::VOPC ||
-			      inst.opcode == ShaderRecompiler::Decoder::Opcode::S_MOV_B64 ||
-			      inst.opcode == ShaderRecompiler::Decoder::Opcode::S_AND_SAVEEXEC_B64)) ||
+			      inst.family == ShaderRecompiler::Decoder::Family::SOP1 ||
+			      inst.family == ShaderRecompiler::Decoder::Family::VOPC)) ||
 			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&
 			     (op.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && &op == &operands[0])) ||
 			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&
@@ -216,7 +223,8 @@ struct GnmSession::State {
 namespace {
 bool PrepareDraw(GnmSession::State& session, const Registers& registers, uint32_t count,
                  std::map<uint64_t, Target>& targets, Operation& draw,
-                 std::vector<std::pair<uint64_t, size_t>>& shader_ranges) {
+                 std::vector<std::pair<uint64_t, size_t>>& shader_ranges,
+                 const ShaderRecompiler::Gcn::ShaderMemory& read_resource) {
 	const auto fail = [&](const std::string& reason) {
 		session.error = reason;
 		return false;
@@ -334,45 +342,40 @@ bool PrepareDraw(GnmSession::State& session, const Registers& registers, uint32_
 				return fail("GCN shader unreadable: " + compile_error);
 			code.push_back(word);
 			if (word != 0xbf810000u) continue;
-			ShaderRecompiler::Gcn::BufferDescriptor              buffer;
 			std::vector<ShaderRecompiler::Gcn::BufferDescriptor> resources;
-			ShaderRecompiler::Gcn::ImageDescriptor               texture;
+			std::vector<ShaderRecompiler::Gcn::ImageDescriptor>  textures;
 			std::vector<ShaderRecompiler::Gcn::ScalarRead>         scalar_reads;
 			std::vector<uint32_t>                               normalized;
 			uint32_t                                            scalar_registers = 0;
-			if (ShaderRecompiler::Gcn::Compile(
+			uint32_t                                            writable_buffers = 0;
+			if (ShaderRecompiler::Gcn::CompileImages(
 			        code,
 			        vertex ? ShaderRecompiler::Gcn::Stage::Vertex
 			               : ShaderRecompiler::Gcn::Stage::Pixel,
-			        spirv, compile_error, data, parameter_count, &buffer,
+			        spirv, compile_error, data, parameter_count,
 			        std::span<const uint32_t>(parameter_map).first(parameter_count),
-			        input_enable == 32, &resources, &texture,
-			        [&](uint64_t base, std::span<uint8_t> bytes) {
-				        return Read(session.memory, base, bytes);
-			        }, &scalar_reads, &normalized, &scalar_registers)) {
+			        input_enable == 32, resources, textures,
+			        read_resource, &scalar_reads, &normalized, &scalar_registers, &writable_buffers)) {
 				if (scalar_registers > (((rsrc1 >> 6) & 15) + 1) * 8)
 					return fail("fetch/scalar prelude exceeds declared SGPR allocation");
 				if (!RegisterLimits(normalized, {}, vertex, rsrc1, session.error, parameter_count))
 					return false;
-				if (buffer.size) {
-					for (size_t index = 0; index < resources.size(); ++index) {
-						const auto& resource = resources[index];
-						auto& snapshot = vertex ? (index ? draw.vertex_buffer2 : draw.vertex_buffer)
-						                        : (index ? draw.pixel_buffer2 : draw.pixel_buffer);
-						(vertex ? (index ? draw.vertex_address2 : draw.vertex_address)
-						        : (index ? draw.buffer_address2 : draw.buffer_address)) =
-						    resource.address;
-						snapshot.resize(resource.size);
-						if (!Read(session.memory, resource.address, snapshot))
-							return fail("PS4 shader buffer unreadable");
-					}
+				auto& buffers = vertex ? draw.vertex_buffers : draw.pixel_buffers;
+				for (size_t index = 0; index < resources.size(); ++index) {
+					const auto& resource = resources[index];
+					auto& snapshot = buffers[index];
+					snapshot.address = resource.address;
+					snapshot.writable = (writable_buffers & (1u << index)) != 0;
+					snapshot.bytes.resize(resource.size);
+					if (!read_resource(resource.address, snapshot.bytes))
+						return fail("PS4 shader buffer unreadable");
 				}
-				if (texture.size) {
-					auto& descriptor = vertex ? draw.vertex_image : draw.pixel_image;
-					auto& pixels     = vertex ? draw.vertex_texels : draw.pixel_texels;
-					descriptor       = texture;
-					pixels.resize(texture.size);
-					if (!Read(session.memory, texture.address, pixels))
+				for (size_t index = 0; index < textures.size(); ++index) {
+					const auto& texture = textures[index];
+					auto& snapshot = (vertex ? draw.vertex_images : draw.pixel_images)[index];
+					snapshot.descriptor = texture;
+					snapshot.pixels.resize(texture.size);
+					if (!read_resource(texture.address, snapshot.pixels))
 						return fail("PS4 image payload unreadable");
 				}
 				draw.scalar_reads.insert(draw.scalar_reads.end(), scalar_reads.begin(), scalar_reads.end());
@@ -519,6 +522,24 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 	std::vector<std::pair<uint64_t, size_t>> shader_ranges;
 	uint32_t                                 draw_count = 0, transfer_count = 0;
 	uint64_t                                 resource_bytes = 0;
+	size_t transfer_bytes = 0;
+	std::vector<size_t> transfer_indices;
+	const auto read_resource = [&](uint64_t address, std::span<uint8_t> bytes) {
+		if (!Read(s.memory, address, bytes)) return false;
+		for (const auto index : transfer_indices) {
+			auto& operation = operations[index];
+			const auto& write = operation.transfer.writes.front();
+			const uint64_t destination = operation.transfer.target.address;
+			const size_t size = write.words.size() * 4;
+			const uint64_t start = std::max(address, destination);
+			const uint64_t end = std::min(address + bytes.size(), destination + size);
+			if (start >= end) continue;
+			std::memcpy(bytes.data() + (start - address),
+			            reinterpret_cast<const uint8_t*>(write.words.data()) + (start - destination),
+			            size_t(end - start));
+		}
+		return true;
+	};
 	std::function<int32_t(std::span<const uint32_t>, uint32_t, uint64_t, uint32_t)> parse;
 	parse = [&](std::span<const uint32_t> commands, uint32_t command_index,
 	            uint64_t command_address, uint32_t depth) -> int32_t {
@@ -579,12 +600,27 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 				registers.instances = true;
 			} else if (op == 0x37 || op == 0x50) {
 				if (++transfer_count > 4096) return s.Reject("GNM transfer count budget exceeded");
+				const bool write = op == 0x37;
+				if ((write && words < 5) || (!write && words != 7))
+					return s.Reject("invalid GNM transfer packet length");
+				const uint64_t destination = write
+				    ? commands[pc + 2] | (uint64_t(commands[pc + 3]) << 32)
+				    : commands[pc + 4] | (uint64_t(commands[pc + 5]) << 32);
+				const size_t bytes = write ? (words - 4) * 4 : commands[pc + 6] & 0x1fffffu;
+				if (bytes > 16 * 1024 * 1024 - transfer_bytes)
+					return s.Reject("GNM transfer byte budget exceeded");
+				if (!destination || destination >= (1ull << 40) || bytes > (1ull << 40) - destination)
+					return s.Reject("invalid GNM transfer address");
 				Operation operation {};
 				operation.command_address = command_address;
 				operation.command_dword = uint32_t(pc);
 				operation.command_opcode = op;
-				operation.transfer_packet.assign(commands.begin() + pc,
-				                                 commands.begin() + pc + words);
+				const uint32_t pitch = uint32_t((bytes + 255) & ~size_t(255));
+				if (!Graphics::Ps4::DecodeTransfers(commands.subspan(pc, words),
+				                                    {destination, 1, 1, pitch}, operation.transfer, s.error))
+					return s.Reject(s.error);
+				transfer_bytes += bytes;
+				transfer_indices.push_back(operations.size());
 				operations.push_back(std::move(operation));
 			} else if (op == 0x2d || op == 0x27) {
 				const bool indexed = op == 0x27;
@@ -598,7 +634,7 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 				draw.command_address = command_address;
 				draw.command_dword = uint32_t(pc);
 				draw.command_opcode = op;
-				if (!PrepareDraw(s, registers, vertex_count, targets, draw, shader_ranges))
+				if (!PrepareDraw(s, registers, vertex_count, targets, draw, shader_ranges, read_resource))
 					return s.Reject(s.error);
 				if (indexed) {
 					draw.index_address = commands[pc + 2] | (uint64_t(commands[pc + 3]) << 32);
@@ -607,13 +643,35 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 					    draw.index_address >= (1ull << 40) || bytes > (1ull << 40) - draw.index_address)
 						return s.Reject("invalid GNM index buffer range/alignment");
 					draw.indices.resize(bytes);
-					if (!Read(s.memory, draw.index_address, draw.indices))
+					if (!read_resource(draw.index_address, draw.indices))
 						return s.Reject("unreadable GNM index buffer payload");
 					draw.raster.index_bytes = registers.index_bytes;
 				}
-				resource_bytes += draw.pixel_buffer.size() + draw.pixel_buffer2.size() +
-				                  draw.vertex_buffer.size() + draw.vertex_buffer2.size() +
-				                  draw.pixel_texels.size() + draw.vertex_texels.size() + draw.indices.size();
+				for (const auto index : transfer_indices) {
+					auto& transfer = operations[index];
+					if (transfer.observed_by_draw) continue;
+					const auto destination = transfer.transfer.target.address;
+					const auto bytes = transfer.transfer.writes.front().words.size() * 4;
+					const auto contains = [&](uint64_t base, size_t size) {
+						return destination >= base && destination - base <= size &&
+						       bytes <= size - (destination - base);
+					};
+					transfer.observed_by_draw = contains(draw.index_address, draw.indices.size());
+					for (const auto& read : draw.scalar_reads)
+						transfer.observed_by_draw |= contains(read.address, read.bytes);
+					for (const auto* buffers : {&draw.pixel_buffers, &draw.vertex_buffers})
+						for (const auto& buffer : *buffers)
+							transfer.observed_by_draw |= contains(buffer.address, buffer.bytes.size());
+					for (const auto* images : {&draw.pixel_images, &draw.vertex_images})
+						for (const auto& image : *images)
+							transfer.observed_by_draw |= contains(image.descriptor.address, image.pixels.size());
+				}
+				auto draw_bytes = draw.indices.size();
+				for (const auto* buffers : {&draw.pixel_buffers, &draw.vertex_buffers})
+					for (const auto& buffer : *buffers) draw_bytes += buffer.bytes.size();
+				for (const auto* images : {&draw.pixel_images, &draw.vertex_images})
+					for (const auto& image : *images) draw_bytes += image.pixels.size();
+				resource_bytes += draw_bytes;
 				for (const auto& read: draw.scalar_reads) resource_bytes += read.bytes;
 				if (resource_bytes > 16 * 1024 * 1024)
 					return s.Reject("shader resource snapshot byte budget exceeded");
@@ -621,9 +679,7 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 				draw.evidence_ordinal = ++s.next_draw_ordinal;
 				if (s.evidence.size() == 256) s.evidence.pop_front();
 				s.evidence.push_back({s.attempt, draw.evidence_ordinal, draw.target,
-				                      draw.pixel_buffer.size() + draw.pixel_buffer2.size() +
-				                          draw.vertex_buffer.size() + draw.vertex_buffer2.size() +
-				                          draw.pixel_texels.size() + draw.vertex_texels.size() + draw.indices.size(),
+				                      draw_bytes,
 				                      uint32_t(command_index), uint32_t(pc),
 				                      uint32_t(draw.vertex.size()), uint32_t(draw.pixel.size())});
 				s.evidence.back().command_address = command_address;
@@ -637,6 +693,46 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 	};
 	for (uint32_t i = 0; i < buffers.size(); ++i)
 		if (const auto result = parse(buffers[i], i, addresses[i], 0)) return result;
+	std::vector<Operation::BufferSnapshot*> shader_writes;
+	for (auto& operation : operations)
+		for (auto* buffers : {&operation.pixel_buffers, &operation.vertex_buffers})
+			for (auto& buffer : *buffers)
+				if (buffer.writable) shader_writes.push_back(&buffer);
+	for (const auto* write : shader_writes) {
+		const auto size = write->bytes.size();
+		if (!Writable(s.memory, write->address, size))
+			return s.Reject("PS4 shader write range is not writable");
+		const auto aliases = [&](uint64_t address, size_t bytes) {
+			return bytes && (address <= write->address ? write->address - address < bytes
+			                                          : address - write->address < size);
+		};
+		for (const auto& [address, bytes] : command_ranges)
+			if (aliases(address, bytes)) return s.Reject("PS4 shader write aliases command memory");
+		for (const auto& [address, bytes] : shader_ranges)
+			if (aliases(address, bytes)) return s.Reject("PS4 shader write aliases code");
+		if (aliases(dcbs, count * 8) || aliases(sizes, count * 4))
+			return s.Reject("PS4 shader write aliases command arrays");
+		for (const auto index : transfer_indices) {
+			const auto& transfer = operations[index].transfer;
+			if (aliases(transfer.target.address, transfer.writes.front().words.size() * 4))
+				return s.Reject("PS4 shader write aliases a PM4 transfer");
+		}
+		for (const auto& operation : operations) {
+			if (aliases(operation.index_address, operation.indices.size()))
+				return s.Reject("PS4 shader write aliases an index snapshot");
+			for (const auto& read : operation.scalar_reads)
+				if (aliases(read.address, read.bytes))
+					return s.Reject("PS4 shader write aliases a scalar prelude snapshot");
+			for (const auto* images : {&operation.pixel_images, &operation.vertex_images})
+				for (const auto& image : *images)
+					if (aliases(image.descriptor.address, image.pixels.size()))
+						return s.Reject("PS4 shader write aliases an image snapshot");
+			for (const auto* buffers : {&operation.pixel_buffers, &operation.vertex_buffers})
+				for (const auto& buffer : *buffers)
+					if (&buffer != write && aliases(buffer.address, buffer.bytes.size()))
+						return s.Reject("PS4 shader write aliases another buffer snapshot");
+		}
+	}
 	// Capture does not grant permission for output to modify pending command,
 	// shader or scalar table bytes. Reject these aliases before any host draw.
 	for (const auto& [address, target]: targets) {
@@ -650,27 +746,29 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 	}
 	for (const auto& operation: operations) {
 		// Descriptor/constant table bytes were snapshotted before any host work.
-		// Do not permit a draw or transfer to overwrite a table in the batch.
+		// Draw targets cannot overlap table reads. Ordered resource transfers are staged separately.
 		for (const auto& read: operation.scalar_reads)
 			for (const auto& [address, target]: targets)
 				if (read.address <= address ? address - read.address < read.bytes
 				                            : read.address - address < target.pixels.size())
 					return s.Reject("scalar table aliases a draw target in this batch");
-		const std::pair<uint64_t, size_t> ranges[] = {
-		    {operation.buffer_address, operation.pixel_buffer.size()},
-		    {operation.buffer_address2, operation.pixel_buffer2.size()},
-		    {operation.vertex_address, operation.vertex_buffer.size()},
-		    {operation.vertex_address2, operation.vertex_buffer2.size()},
-		    {operation.pixel_image.address, operation.pixel_texels.size()},
-		    {operation.vertex_image.address, operation.vertex_texels.size()},
-		    {operation.index_address, operation.indices.size()}};
-		for (auto [base, bytes]: ranges) {
-			if (!bytes) continue;
-			for (const auto& [address, target]: targets)
-				if (base <= address ? address - base < bytes
-				                    : base - address < target.pixels.size())
+		const auto aliases_target = [&](uint64_t base, size_t bytes) {
+			if (!bytes) return false;
+			for (const auto& [address, target] : targets)
+				if (base <= address ? address - base < bytes : base - address < target.pixels.size())
+					return true;
+			return false;
+		};
+		for (const auto* images : {&operation.pixel_images, &operation.vertex_images})
+			for (const auto& image : *images)
+				if (aliases_target(image.descriptor.address, image.pixels.size()))
 					return s.Reject("shader resource aliases a draw target in this batch");
-		}
+		for (const auto* buffers : {&operation.pixel_buffers, &operation.vertex_buffers})
+			for (const auto& buffer : *buffers)
+				if (aliases_target(buffer.address, buffer.bytes.size()))
+					return s.Reject("shader resource aliases a draw target in this batch");
+		if (aliases_target(operation.index_address, operation.indices.size()))
+			return s.Reject("shader resource aliases a draw target in this batch");
 	}
 	// Resolve transfers only after every target and draw has been validated. Commands
 	// and shaders are snapshots: reject mixed batches whose outputs could alter either.
@@ -689,31 +787,32 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 			    overlaps(address, target.pixels.size(), sizes, count * 4))
 				return s.Reject("GNM mixed-batch target aliases command arrays");
 		}
-		size_t transfer_bytes = 0;
-		for (auto& operation: operations) {
-			const auto& packet = operation.transfer_packet;
-			if (packet.empty()) continue;
-			const bool write = ((packet[0] >> 8) & 255) == 0x37;
-			if ((write && packet.size() < 5) || (!write && packet.size() != 7))
-				return s.Reject("invalid GNM transfer packet length");
-			const uint64_t destination = write ? packet[2] | (uint64_t(packet[3]) << 32)
-			                                   : packet[4] | (uint64_t(packet[5]) << 32);
-			auto           target      = targets.upper_bound(destination);
-			if (target == targets.begin()) return s.Reject("GNM transfer has no draw target");
-			--target;
-			const auto& t = target->second;
-			if (destination - target->first >= t.pixels.size())
-				return s.Reject("GNM transfer outside validated draw target");
-			if (!Graphics::Ps4::DecodeTransfers(packet,
-			                                    {target->first, t.width, t.height, t.width * 4},
-			                                    operation.transfer, s.error))
-				return s.Reject(s.error);
-			for (const auto& write: operation.transfer.writes) {
-				if (write.words.size() * 4 > 16 * 1024 * 1024 - transfer_bytes)
-					return s.Reject("GNM transfer byte budget exceeded");
-				transfer_bytes += write.words.size() * 4;
+		for (const auto index : transfer_indices) {
+			auto& operation = operations[index];
+			auto& write = operation.transfer.writes.front();
+			const uint64_t destination = operation.transfer.target.address;
+			const size_t bytes = write.words.size() * 4;
+			for (const auto& [address, target] : targets) {
+				if (!overlaps(destination, bytes, address, target.pixels.size())) continue;
+				if (destination < address || bytes > target.pixels.size() - (destination - address))
+					return s.Reject("GNM transfer crosses a draw target boundary");
+				operation.target = address;
+				operation.transfer.target = {address, target.width, target.height, target.width * 4};
+				write.offset = uint32_t(destination - address);
+				break;
 			}
-			operation.target = target->first;
+			if (operation.target) continue;
+			if (!operation.observed_by_draw || !Writable(s.memory, destination, bytes))
+				return s.Reject("GNM transfer outside a writable resource read by a later draw");
+			const auto aliases = [&](const auto& range) {
+				return overlaps(destination, bytes, range.first, range.second);
+			};
+			if (std::any_of(shader_ranges.begin(), shader_ranges.end(), aliases) ||
+			    std::any_of(command_ranges.begin(), command_ranges.end(), aliases) ||
+			    overlaps(destination, bytes, dcbs, count * 8) ||
+			    overlaps(destination, bytes, sizes, count * 4))
+				return s.Reject("GNM resource transfer aliases shader or command memory");
+			operation.resource_transfer = true;
 		}
 	}
 	if (draw_count && !s.renderer) {
@@ -732,8 +831,9 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 		progress.command_dword = draw.command_dword;
 		progress.opcode = draw.command_opcode;
 		progress.target = draw.target;
+		if (draw.resource_transfer) continue;
 		auto& target = targets.at(draw.target);
-		if (!draw.transfer_packet.empty()) {
+		if (!draw.transfer.writes.empty()) {
 			if (!Graphics::Ps4::ApplyTransfers(draw.transfer, target.pixels, s.error))
 				return s.Reject(s.error);
 			continue;
@@ -741,14 +841,35 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 		auto state           = draw.raster;
 		state.initial_pixels = target.pixels;
 		state.indices        = draw.indices;
-		state.pixel_buffer   = draw.pixel_buffer;
-		state.pixel_buffer2  = draw.pixel_buffer2;
-		state.vertex_buffer  = draw.vertex_buffer;
-		state.vertex_buffer2 = draw.vertex_buffer2;
-		state.pixel_texture  = {draw.pixel_image.width, draw.pixel_image.height,
-		                        draw.pixel_image.pitch, draw.pixel_texels};
-		state.vertex_texture = {draw.vertex_image.width, draw.vertex_image.height,
-		                        draw.vertex_image.pitch, draw.vertex_texels};
+		const auto bind_buffers = [](const auto& buffers, auto& first, auto& second, auto& third, auto& tail) {
+			first = buffers[0].bytes;
+			second = buffers[1].bytes;
+			third = buffers[2].bytes;
+			for (size_t i = 0; i < tail.size(); ++i) tail[i] = buffers[i + 3].bytes;
+		};
+		bind_buffers(draw.pixel_buffers, state.pixel_buffer, state.pixel_buffer2, state.pixel_buffer3, state.pixel_buffer_tail);
+		bind_buffers(draw.vertex_buffers, state.vertex_buffer, state.vertex_buffer2, state.vertex_buffer3, state.vertex_buffer_tail);
+		for (size_t i = 0; i < Graphics::Ps4::BuffersPerStage; ++i) {
+			if (draw.pixel_buffers[i].writable) {
+				state.pixel_storage_writes = true;
+				state.storage_readback[i] = draw.pixel_buffers[i].bytes;
+			}
+			if (draw.vertex_buffers[i].writable) {
+				state.vertex_storage_writes = true;
+				state.storage_readback[Graphics::Ps4::BuffersPerStage + i] = draw.vertex_buffers[i].bytes;
+			}
+		}
+		const auto bind_images = [](const auto& images, auto& first, auto& second, auto& tail) {
+			const auto bind = [](const auto& image) {
+				const auto& d = image.descriptor;
+				return Graphics::Ps4::Texture2D {d.width, d.height, d.pitch, image.pixels};
+			};
+			first = bind(images[0]);
+			second = bind(images[1]);
+			for (size_t i = 0; i < tail.size(); ++i) tail[i] = bind(images[i + 2]);
+		};
+		bind_images(draw.pixel_images, state.pixel_texture, state.pixel_texture2, state.pixel_texture_tail);
+		bind_images(draw.vertex_images, state.vertex_texture, state.vertex_texture2, state.vertex_texture_tail);
 		std::vector<uint8_t> pixels;
 		if (!s.renderer->Render(state, draw.vertex, draw.pixel, pixels, s.error) ||
 		    pixels.size() != target.pixels.size())
@@ -766,6 +887,26 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 		if (!Writable(s.memory, address, target.pixels.size()))
 			return s.Reject("GNM framebuffer mapping lost before commit");
 	}
+	for (const auto index : transfer_indices) {
+		const auto& operation = operations[index];
+		if (!operation.resource_transfer) continue;
+		const auto address = operation.transfer.target.address;
+		const auto& words = operation.transfer.writes.front().words;
+		if (!Writable(s.memory, address, words.size() * 4))
+			return s.Reject("GNM shader resource mapping lost before commit");
+	}
+	for (const auto* write : shader_writes)
+		if (!Writable(s.memory, write->address, write->bytes.size()))
+			return s.Reject("GNM shader write mapping lost before commit");
+	for (const auto index : transfer_indices) {
+		const auto& operation = operations[index];
+		if (!operation.resource_transfer) continue;
+		const auto address = operation.transfer.target.address;
+		const auto& words = operation.transfer.writes.front().words;
+		s.submission_evidence.back().target = address;
+		if (!s.memory.write(address, {reinterpret_cast<const uint8_t*>(words.data()), words.size() * 4}))
+			return s.Reject("GNM shader resource commit failed");
+	}
 	for (const auto& [address, target]: targets) {
 		s.submission_evidence.back().target = address;
 		if (!s.memory.write(address, target.pixels))
@@ -773,6 +914,11 @@ int32_t GnmSession::SubmitOnWorker(uint32_t count, uint64_t dcbs, uint64_t sizes
 		for (auto& row: s.evidence)
 			if (row.attempt == s.attempt && row.target == address && row.host_completed)
 				row.guest_published = true;
+	}
+	for (const auto* write : shader_writes) {
+		s.submission_evidence.back().target = write->address;
+		if (!s.memory.write(write->address, write->bytes))
+			return s.Reject("GNM shader write commit failed");
 	}
 	s.registers = std::move(registers);
 	++s.stats.submissions;

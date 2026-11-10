@@ -133,7 +133,7 @@ std::string FormatMimg(const Instruction& inst) {
 		                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 		                    inst.image_address_components);
 	}
-	if (inst.image_nsa_dwords != 0) {
+	if (inst.family == Family::MIMG && inst.image_nsa_dwords != 0) {
 		text += fmt::format(" nsa_dwords={} nsa_addr=", inst.image_nsa_dwords);
 		const auto count =
 		    std::min<uint32_t>(inst.image_nsa_dwords * 4u, MaxImageNsaAddressComponents);

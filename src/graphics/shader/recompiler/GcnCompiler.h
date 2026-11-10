@@ -37,4 +37,11 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
              const ShaderMemory& memory = {}, std::vector<ScalarRead>* scalar_reads = nullptr,
              std::vector<uint32_t>* normalized_code = nullptr,
              uint32_t* scalar_registers = nullptr);
+bool CompileImages(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>& spirv,
+                   std::string& error, std::span<const uint32_t> user_data, uint32_t parameter_count,
+                   std::span<const uint32_t> parameter_map, bool no_perspective,
+                   std::vector<BufferDescriptor>& resources, std::vector<ImageDescriptor>& images,
+                   const ShaderMemory& memory = {}, std::vector<ScalarRead>* scalar_reads = nullptr,
+                   std::vector<uint32_t>* normalized_code = nullptr, uint32_t* scalar_registers = nullptr,
+                   uint32_t* writable_buffers = nullptr);
 } // namespace Libs::Graphics::ShaderRecompiler::Gcn

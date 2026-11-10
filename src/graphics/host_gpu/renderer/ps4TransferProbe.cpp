@@ -68,17 +68,23 @@ void CheckProbe(VkResult result, const char* operation) {
 	X(CmdBindDescriptorSets) \
 	X(CmdPushConstants)
 // clang-format on
+constexpr uint32_t RasterImageCount = 2 * Ps4::ImagesPerStage;
+constexpr uint32_t ImageUploadBase = 3 + 2 * Ps4::BuffersPerStage;
+constexpr uint32_t IndexBufferSlot = ImageUploadBase + RasterImageCount;
+constexpr uint32_t TargetMemorySlot = IndexBufferSlot + 1;
+constexpr uint32_t ImageMemoryBase = TargetMemorySlot + 1;
+
 struct Resources {
 	const TransferDevice& host;
 #define MEMBER(name) PFN_vk##name name = nullptr;
 	PROBE_VK_FUNCTIONS(MEMBER)
 #undef MEMBER
-	VkBuffer              buffers[10] {};
-	VkDeviceMemory        memories[13] {};
+	VkBuffer              buffers[IndexBufferSlot + 1] {};
+	VkDeviceMemory        memories[ImageMemoryBase + RasterImageCount] {};
 	VkImage               image {};
-	VkImage               textures[2] {};
+	VkImage               textures[RasterImageCount] {};
 	VkSampler             samplers[2] {};
-	VkImageView           texture_views[2] {};
+	VkImageView           texture_views[RasterImageCount] {};
 	VkCommandPool         pool {};
 	VkFence               fence {};
 	VkShaderModule        shaders[2] {};
@@ -184,8 +190,8 @@ bool ProbePs4Transfers(const TransferDevice& host, const Ps4::TransferPlan& plan
 		CheckProbe(r.CreateImage(host.device, &image, nullptr, &r.image), "CreateImage");
 		VkMemoryRequirements req;
 		r.GetImageMemoryRequirements(host.device, r.image, &req);
-		r.Allocate(req, 0, r.memories[9]);
-		CheckProbe(r.BindImageMemory(host.device, r.image, r.memories[9], 0), "BindImageMemory");
+		r.Allocate(req, 0, r.memories[TargetMemorySlot]);
+		CheckProbe(r.BindImageMemory(host.device, r.image, r.memories[TargetMemorySlot], 0), "BindImageMemory");
 		void* mapped = nullptr;
 		CheckProbe(r.MapMemory(host.device, r.memories[0], 0, staging_bytes, 0, &mapped),
 		           "Map upload");
@@ -348,8 +354,8 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		           "Create GCN render target");
 		VkMemoryRequirements req;
 		r.GetImageMemoryRequirements(host.device, r.image, &req);
-		r.Allocate(req, 0, r.memories[9]);
-		CheckProbe(r.BindImageMemory(host.device, r.image, r.memories[9], 0), "Bind raster target");
+		r.Allocate(req, 0, r.memories[TargetMemorySlot]);
+		CheckProbe(r.BindImageMemory(host.device, r.image, r.memories[TargetMemorySlot], 0), "Bind raster target");
 		VkImageViewCreateInfo view {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
 		view.image            = r.image;
 		view.viewType         = VK_IMAGE_VIEW_TYPE_2D;
@@ -369,15 +375,14 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		constexpr VkShaderStageFlags buffer_stages =
 		    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 		VkPushConstantRange            push {buffer_stages, 0, 128};
-		const std::span<const uint8_t> payloads[]       = {s.pixel_buffer, s.pixel_buffer2,
-		                                                   s.vertex_buffer, s.vertex_buffer2};
-		const Ps4::Texture2D           image_payloads[] = {s.pixel_texture, s.vertex_texture};
-		VkDescriptorBufferInfo         buffer_infos[4] {};
-		VkDescriptorImageInfo          image_infos[2] {};
+		const auto payloads = Ps4::RasterBuffers(s);
+		const auto image_payloads = Ps4::RasterImages(s);
+		VkDescriptorBufferInfo         buffer_infos[2 * Ps4::BuffersPerStage] {};
+		VkDescriptorImageInfo          image_infos[RasterImageCount] {};
 		std::vector<VkDescriptorSetLayoutBinding> bindings;
 		std::vector<VkWriteDescriptorSet>         writes;
 		uint32_t                                  buffers_used = 0, images_used = 0;
-		for (uint32_t i = 0; i < 4; ++i) {
+		for (uint32_t i = 0; i < payloads.size(); ++i) {
 			if (payloads[i].empty()) continue;
 			r.Buffer(3 + i, payloads[i].size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 			         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -390,62 +395,68 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			++buffers_used;
 		}
 		for (uint32_t stage = 0; stage < 2; ++stage) {
-			const uint32_t           first = stage * 2, count = payloads[first].empty()
-			                                                        ? 0
-			                                                        : (payloads[first + 1].empty() ? 1 : 2);
+			const uint32_t           first = stage * Ps4::BuffersPerStage;
+			uint32_t count = 0;
+			while (count < Ps4::BuffersPerStage && !payloads[first + count].empty()) ++count;
 			const VkShaderStageFlags visibility =
 			    stage ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
 			if (count) {
-				bindings.push_back({stage ? 60u : 58u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count,
+				bindings.push_back({Ps4::BufferBinding + first, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count,
 				                    visibility, nullptr});
 				VkWriteDescriptorSet write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-				write.dstBinding      = stage ? 60 : 58;
+				write.dstBinding      = Ps4::BufferBinding + first;
 				write.descriptorCount = count;
 				write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 				write.pBufferInfo     = &buffer_infos[first];
 				writes.push_back(write);
 			}
-			const auto& t = image_payloads[stage];
-			if (t.pixels.empty()) continue;
-			VkImageCreateInfo ci {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-			ci.imageType = VK_IMAGE_TYPE_2D;
-			ci.format    = VK_FORMAT_R8G8B8A8_UNORM;
-			ci.extent    = {t.width, t.height, 1};
-			ci.mipLevels = ci.arrayLayers = 1;
-			ci.samples                    = VK_SAMPLE_COUNT_1_BIT;
-			ci.tiling                     = VK_IMAGE_TILING_OPTIMAL;
-			ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-			CheckProbe(r.CreateImage(host.device, &ci, nullptr, &r.textures[stage]),
-			           "Create shader image");
-			VkMemoryRequirements req;
-			r.GetImageMemoryRequirements(host.device, r.textures[stage], &req);
-			r.Allocate(req, 0, r.memories[10 + stage]);
-			CheckProbe(r.BindImageMemory(host.device, r.textures[stage], r.memories[10 + stage], 0),
-			           "Bind shader image");
-			VkImageViewCreateInfo view {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-			view.image            = r.textures[stage];
-			view.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-			view.format           = ci.format;
-			view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-			CheckProbe(r.CreateImageView(host.device, &view, nullptr, &r.texture_views[stage]),
-			           "Create shader image view");
-			r.Buffer(7 + stage, t.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-			         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-			void* data;
-			CheckProbe(
-			    r.MapMemory(host.device, r.memories[7 + stage], 0, t.pixels.size(), 0, &data),
-			    "Map image upload");
-			std::memcpy(data, t.pixels.data(), t.pixels.size());
-			r.UnmapMemory(host.device, r.memories[7 + stage]);
-			image_infos[stage] = {VK_NULL_HANDLE, r.texture_views[stage],
-			                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+			const uint32_t first_image = stage * Ps4::ImagesPerStage;
+			uint32_t image_count = 0;
+			for (uint32_t slot = first_image; slot < first_image + Ps4::ImagesPerStage; ++slot) {
+				const auto& t = image_payloads[slot];
+				if (t.pixels.empty()) break;
+				VkImageCreateInfo ci {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+				ci.imageType = VK_IMAGE_TYPE_2D;
+				ci.format    = VK_FORMAT_R8G8B8A8_UNORM;
+				ci.extent    = {t.width, t.height, 1};
+				ci.mipLevels = ci.arrayLayers = 1;
+				ci.samples                    = VK_SAMPLE_COUNT_1_BIT;
+				ci.tiling                     = VK_IMAGE_TILING_OPTIMAL;
+				ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+				CheckProbe(r.CreateImage(host.device, &ci, nullptr, &r.textures[slot]),
+				           "Create shader image");
+				VkMemoryRequirements req;
+				r.GetImageMemoryRequirements(host.device, r.textures[slot], &req);
+				r.Allocate(req, 0, r.memories[ImageMemoryBase + slot]);
+				CheckProbe(r.BindImageMemory(host.device, r.textures[slot], r.memories[ImageMemoryBase + slot], 0),
+				           "Bind shader image");
+				VkImageViewCreateInfo view {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+				view.image            = r.textures[slot];
+				view.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+				view.format           = ci.format;
+				view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+				CheckProbe(r.CreateImageView(host.device, &view, nullptr, &r.texture_views[slot]),
+				           "Create shader image view");
+				r.Buffer(ImageUploadBase + slot, t.pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+				         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+				void* data;
+				CheckProbe(
+				    r.MapMemory(host.device, r.memories[ImageUploadBase + slot], 0, t.pixels.size(), 0, &data),
+				    "Map image upload");
+				std::memcpy(data, t.pixels.data(), t.pixels.size());
+				r.UnmapMemory(host.device, r.memories[ImageUploadBase + slot]);
+				image_infos[slot] = {VK_NULL_HANDLE, r.texture_views[slot],
+				                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+				++image_count;
+			}
+			if (!image_count) continue;
 			bindings.push_back(
-			    {64 + stage, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, visibility, nullptr});
+			    {Ps4::ImageBinding + first_image, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, image_count, visibility, nullptr});
 			VkWriteDescriptorSet write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-			write.dstBinding      = 64 + stage;
-			write.descriptorCount = 1;
+			write.dstBinding      = Ps4::ImageBinding + first_image;
+			write.descriptorCount = image_count;
 			write.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-			write.pImageInfo      = &image_infos[stage];
+			write.pImageInfo      = &image_infos[first_image];
 			writes.push_back(write);
 			VkSamplerCreateInfo sampler {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
 			sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
@@ -457,9 +468,9 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			CheckProbe(r.CreateSampler(host.device, &sampler, nullptr, &r.samplers[stage]),
 			           "Create PS4 nearest/clamp sampler");
 			// Immutable sampler: no extra descriptor payload or dangling local array.
-			bindings.push_back({66 + stage, VK_DESCRIPTOR_TYPE_SAMPLER, 1, visibility,
+			bindings.push_back({Ps4::SamplerBinding + stage, VK_DESCRIPTOR_TYPE_SAMPLER, 1, visibility,
 			                    &r.samplers[stage]});
-			++images_used;
+			images_used += image_count;
 		}
 		const bool has_resources = !bindings.empty();
 		if (has_resources) {
@@ -567,12 +578,12 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			r.UnmapMemory(host.device, r.memories[0]);
 		}
 		if (!s.indices.empty()) {
-			r.Buffer(9, s.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-			         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 12);
+			r.Buffer(IndexBufferSlot, s.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+			         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 			void* data;
-			CheckProbe(r.MapMemory(host.device, r.memories[12], 0, s.indices.size(), 0, &data), "Map PS4 indices");
+			CheckProbe(r.MapMemory(host.device, r.memories[IndexBufferSlot], 0, s.indices.size(), 0, &data), "Map PS4 indices");
 			std::memcpy(data, s.indices.data(), s.indices.size());
-			r.UnmapMemory(host.device, r.memories[12]);
+			r.UnmapMemory(host.device, r.memories[IndexBufferSlot]);
 		}
 		VkCommandPoolCreateInfo pool {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
 		pool.queueFamilyIndex = host.family;
@@ -591,12 +602,12 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
 			barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barrier.buffer = r.buffers[9];
+			barrier.buffer = r.buffers[IndexBufferSlot];
 			barrier.size = VK_WHOLE_SIZE;
 			r.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
 			                     0, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
-		for (uint32_t i = 0; i < 2; ++i) {
+		for (uint32_t i = 0; i < RasterImageCount; ++i) {
 			if (!r.textures[i]) continue;
 			VkImageMemoryBarrier barrier {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
 			barrier.image               = r.textures[i];
@@ -612,7 +623,7 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 			copy.bufferRowLength  = image_payloads[i].pitch / 4;
 			copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 			copy.imageExtent      = {image_payloads[i].width, image_payloads[i].height, 1};
-			r.CmdCopyBufferToImage(cmd, r.buffers[7 + i], r.textures[i],
+			r.CmdCopyBufferToImage(cmd, r.buffers[ImageUploadBase + i], r.textures[i],
 			                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 			barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -662,17 +673,30 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		if (has_resources) {
 			r.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.layout, 0, 1,
 			                        &r.descriptor_set, 0, nullptr);
-			const uint32_t data[] = {
-			    0, uint32_t(s.pixel_buffer.size()),  uint32_t(s.pixel_buffer2.size()),  0,
-			    0, uint32_t(s.vertex_buffer.size()), uint32_t(s.vertex_buffer2.size()), 0};
-			r.CmdPushConstants(cmd, r.layout, buffer_stages, 0, sizeof(data), data);
+			const auto data = Ps4::RasterBufferMetadata(s);
+			r.CmdPushConstants(cmd, r.layout, buffer_stages, 0, sizeof(data), data.data());
 		}
 		if (!s.indices.empty()) {
-			r.CmdBindIndexBuffer(cmd, r.buffers[9], 0, s.index_bytes == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+			r.CmdBindIndexBuffer(cmd, r.buffers[IndexBufferSlot], 0, s.index_bytes == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
 			r.CmdDrawIndexed(cmd, s.vertex_count, 1, 0, 0, 0);
 		} else
 			r.CmdDraw(cmd, s.vertex_count, 1, 0, 0);
 		r.CmdEndRenderPass(cmd);
+		std::vector<VkBufferMemoryBarrier> storage_barriers;
+		for (uint32_t i = 0; i < payloads.size(); ++i) {
+			if (s.storage_readback[i].empty()) continue;
+			VkBufferMemoryBarrier barrier {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+			barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer = r.buffers[3 + i];
+			barrier.size = VK_WHOLE_SIZE;
+			storage_barriers.push_back(barrier);
+		}
+		if (!storage_barriers.empty())
+			r.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr,
+			                     uint32_t(storage_barriers.size()), storage_barriers.data(), 0, nullptr);
 		VkBufferImageCopy region {};
 		region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 		region.imageExtent      = texture.extent;
@@ -700,6 +724,19 @@ bool RasterizePs4Probe(const TransferDevice& host, const Ps4::RasterState& s,
 		std::vector<uint8_t> pixels(static_cast<size_t>(bytes));
 		std::memcpy(pixels.data(), mapped, size_t(bytes));
 		r.UnmapMemory(host.device, r.memories[2]);
+		std::array<std::vector<uint8_t>, 2 * Ps4::BuffersPerStage> storage;
+		for (uint32_t i = 0; i < payloads.size(); ++i) {
+			if (s.storage_readback[i].empty()) continue;
+			storage[i].resize(payloads[i].size());
+			void* data;
+			CheckProbe(r.MapMemory(host.device, r.memories[3 + i], 0, storage[i].size(), 0, &data),
+			           "Map PS4 shader readback");
+			std::memcpy(storage[i].data(), data, storage[i].size());
+			r.UnmapMemory(host.device, r.memories[3 + i]);
+		}
+		for (uint32_t i = 0; i < payloads.size(); ++i)
+			if (!storage[i].empty())
+				std::memcpy(s.storage_readback[i].data(), storage[i].data(), storage[i].size());
 		image = std::move(pixels);
 		return true;
 	} catch (const std::exception& e) {

@@ -1,10 +1,17 @@
 #pragma once
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <span>
 #include <string>
 
 namespace Libs::Graphics::Ps4 {
+inline constexpr uint32_t ImagesPerStage = 4;
+inline constexpr uint32_t BuffersPerStage = 8;
+inline constexpr uint32_t BufferBinding = 58;
+inline constexpr uint32_t BufferMetadataDwords = BuffersPerStage + (BuffersPerStage + 3) / 4;
+inline constexpr uint32_t ImageBinding = BufferBinding + 2 * BuffersPerStage;
+inline constexpr uint32_t SamplerBinding = ImageBinding + 2 * ImagesPerStage;
 // Explicit offscreen draw contract, independent of PS5 register encodings.
 // Triangle list, first vertex/instance 0, one instance, optional read-only shader buffers,
 // depth/stencil disabled, no culling, RGBA8 UNorm, one sample.
@@ -15,9 +22,15 @@ struct Texture2D {
 struct RasterState {
 	std::span<const uint8_t>
 	    pixel_buffer; // PS read-only raw SSBO/SRV array (canonical binding 58).
-	std::span<const uint8_t> pixel_buffer2; // Optional second resource in descriptor order.
-	std::span<const uint8_t> vertex_buffer, vertex_buffer2; // VS array, binding 60.
+	std::span<const uint8_t> pixel_buffer2, pixel_buffer3; // Optional resources in descriptor order.
+	std::span<const uint8_t> vertex_buffer, vertex_buffer2, vertex_buffer3;
+	std::array<std::span<const uint8_t>, BuffersPerStage - 3> pixel_buffer_tail, vertex_buffer_tail;
+	// Stage-wide storage-buffer binding mode. The backend owns a private copy for the draw.
+	bool pixel_storage_writes = false, vertex_storage_writes = false;
+	std::array<std::span<uint8_t>, 2 * BuffersPerStage> storage_readback;
 	Texture2D                pixel_texture, vertex_texture;
+	Texture2D                pixel_texture2, vertex_texture2;
+	std::array<Texture2D, ImagesPerStage - 2> pixel_texture_tail, vertex_texture_tail;
 	uint32_t                 width = 64, height = 32;
 	uint32_t                 vertex_count = 3; // count of indices for indexed draws
 	std::span<const uint8_t> indices;
@@ -29,18 +42,68 @@ struct RasterState {
 	std::span<const uint8_t>
 	    initial_pixels; // Optional tightly packed RGBA8 snapshot, retained by caller.
 };
+inline std::array<std::span<const uint8_t>, 2 * BuffersPerStage> RasterBuffers(const RasterState& state) {
+	std::array<std::span<const uint8_t>, 2 * BuffersPerStage> buffers;
+	buffers[0] = state.pixel_buffer;
+	buffers[1] = state.pixel_buffer2;
+	buffers[2] = state.pixel_buffer3;
+	buffers[BuffersPerStage] = state.vertex_buffer;
+	buffers[BuffersPerStage + 1] = state.vertex_buffer2;
+	buffers[BuffersPerStage + 2] = state.vertex_buffer3;
+	for (size_t i = 0; i < state.pixel_buffer_tail.size(); ++i) {
+		buffers[3 + i] = state.pixel_buffer_tail[i];
+		buffers[BuffersPerStage + 3 + i] = state.vertex_buffer_tail[i];
+	}
+	return buffers;
+}
+inline std::array<uint32_t, 2 * BufferMetadataDwords> RasterBufferMetadata(const RasterState& state) {
+	const auto buffers = RasterBuffers(state);
+	std::array<uint32_t, 2 * BufferMetadataDwords> words {};
+	for (size_t stage = 0; stage < 2; ++stage) {
+		const size_t first = stage * BuffersPerStage;
+		size_t count = 0;
+		while (count < BuffersPerStage && !buffers[first + count].empty()) ++count;
+		const size_t sizes = stage * BufferMetadataDwords + (count + 3) / 4;
+		for (size_t i = 0; i < count; ++i) words[sizes + i] = uint32_t(buffers[first + i].size());
+	}
+	return words;
+}
+inline std::array<Texture2D, 2 * ImagesPerStage> RasterImages(const RasterState& state) {
+	return {state.pixel_texture, state.pixel_texture2,
+	        state.pixel_texture_tail[0], state.pixel_texture_tail[1],
+	        state.vertex_texture, state.vertex_texture2,
+	        state.vertex_texture_tail[0], state.vertex_texture_tail[1]};
+}
 inline bool ValidateRasterState(const RasterState& s, std::string& error) {
 	error.clear();
-	for (auto buffer: {s.pixel_buffer, s.pixel_buffer2, s.vertex_buffer, s.vertex_buffer2})
-		if ((!s.pixel_buffer2.empty() && s.pixel_buffer.empty()) ||
-		    (!s.vertex_buffer2.empty() && s.vertex_buffer.empty()) ||
-		    (!buffer.empty() &&
-		     (buffer.size() > 65536 || buffer.size() < 16 || buffer.size() % 4))) {
-			error = "Invalid PS4 pixel buffer snapshot";
+	const auto buffers = RasterBuffers(s);
+	if ((s.pixel_storage_writes && s.pixel_buffer.empty()) ||
+	    (s.vertex_storage_writes && s.vertex_buffer.empty())) {
+		error = "PS4 writable storage stage requires a buffer";
+		return false;
+	}
+	for (size_t i = 0; i < buffers.size(); ++i) {
+		const auto buffer = buffers[i];
+		const auto readback = s.storage_readback[i];
+		if (!readback.empty() && (readback.size() != buffer.size() ||
+		    !(i < BuffersPerStage ? s.pixel_storage_writes : s.vertex_storage_writes))) {
+			error = "Invalid PS4 storage readback range";
 			return false;
 		}
-	for (const auto& t: {s.pixel_texture, s.vertex_texture}) {
+		if (!buffer.empty() && (buffer.size() > 65536 || buffer.size() % 4 ||
+		    (i % BuffersPerStage && buffers[i - 1].empty()))) {
+			error = "Invalid PS4 shader buffer snapshot";
+			return false;
+		}
+	}
+	const auto images = RasterImages(s);
+	for (size_t i = 0; i < images.size(); ++i) {
+		const auto& t = images[i];
 		if (t.pixels.empty() && !t.width && !t.height && !t.pitch) continue;
+		if (i % ImagesPerStage && images[i - 1].pixels.empty()) {
+			error = "Invalid PS4 image binding order";
+			return false;
+		}
 		if (!t.width || !t.height || t.width > 256 || t.height > 256 || t.pitch < t.width * 4 ||
 		    t.pitch > 4096 || t.pitch % 256 || t.pixels.size() != size_t(t.pitch) * t.height) {
 			error = "Invalid PS4 texture snapshot/pitch";

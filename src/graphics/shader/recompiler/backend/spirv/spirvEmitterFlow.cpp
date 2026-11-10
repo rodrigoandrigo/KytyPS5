@@ -714,11 +714,13 @@ void EmitStoreCompletion(EmitterState& state) {
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 
-void EmitDataCacheInvalidate(EmitterState& state) {
+void EmitDataCacheInvalidate(EmitterState& state, const IR::Inst& inst) {
 	// RDNA2 GL0/GL1 invalidation makes vector memory visible without a workgroup rendezvous.
+	const auto semantics = inst.Flags<uint32_t>() ? spv::MemorySemanticsAcquireReleaseMask
+	                                            : spv::MemorySemanticsAcquireMask;
 	state.builder.AddFunction(
 	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask |
+	    ConstantU32(state, semantics | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 

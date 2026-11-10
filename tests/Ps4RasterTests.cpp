@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -262,7 +263,7 @@ static void IntegerCmpxRasterTests(Run run, const std::filesystem::path& folder,
 
 template <typename Run>
 static void DivergentExitRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
-	for (int variant = 89; variant <= 90; ++variant) {
+	for (int variant = 89; variant <= 92; ++variant) {
 		Ps4::RasterState state;
 		std::vector<uint8_t> pixels;
 		std::string error;
@@ -272,7 +273,8 @@ static void DivergentExitRasterTests(Run run, const std::filesystem::path& folde
 			for (uint32_t x = 0; x < 64; ++x) {
 				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
 				const bool inside = u >= 0 && v >= 0 && u + v < 1;
-				const float shade[] {u < .5f ? .75f : u, v, variant == 89 ? .375f : .625f, 1.f};
+				const float red = u < .5f ? .75f : (variant == 91 ? .875f : u);
+				const float shade[] {red, v, variant % 2 ? .375f : .625f, 1.f};
 				for (uint32_t c = 0; c < 4; ++c) {
 					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
 					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
@@ -326,6 +328,10 @@ static void RasterTests(Run run, const std::filesystem::path& folder, const char
 			                      variant == 11 ? .5f : .75f,
 			                      1};
 			std::memcpy(shader_data.data(), data, sizeof(data));
+			if (variant == 10 || variant == 11) {
+				const uint32_t byte_offset = variant == 11 ? 19u : 17u;
+				std::memcpy(shader_data.data(), &byte_offset, sizeof(byte_offset));
+			}
 			if (variant == 13) {
 				const uint32_t signed_input   = uint32_t(-3);
 				const float    negative_input = -1.75f;
@@ -483,9 +489,9 @@ static void RasterTests(Run run, const std::filesystem::path& folder, const char
 			Require(!run(variant, bad, pixels, error) && pixels == saved,
 			        "orphan second buffer changed output");
 			bad               = state;
-			bad.pixel_buffer2 = std::span<const uint8_t>(second_data).first(12);
+			bad.pixel_buffer2 = std::span<const uint8_t>(second_data).first(10);
 			Require(!run(variant, bad, pixels, error) && pixels == saved,
-			        "short second buffer changed output");
+			        "unaligned second buffer changed output");
 		}
 		const auto saved = pixels;
 		state.right      = state.width + 1;
@@ -500,6 +506,152 @@ static void RasterTests(Run run, const std::filesystem::path& folder, const char
 	ElseRasterTests(run, folder, backend);
 	IntegerCmpxRasterTests(run, folder, backend);
 	DivergentExitRasterTests(run, folder, backend);
+	for (int variant = 93; variant <= 122; ++variant) {
+		const std::array<float, 4> color {.25f, .5f, .75f, 1.f};
+		const std::array<uint32_t, 8> data {
+		    variant == 95 || variant == 100 ? UINT32_MAX : variant == 99 ? 16u : 17u,
+		    0, 0, 0, std::bit_cast<uint32_t>(color[0]),
+		    std::bit_cast<uint32_t>(color[1]), std::bit_cast<uint32_t>(color[2]),
+		    std::bit_cast<uint32_t>(color[3])};
+		Ps4::RasterState state;
+		state.pixel_buffer = variant == 93
+		    ? std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(color.data()), sizeof(color))
+		    : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), sizeof(data));
+		if (variant >= 96 && variant <= 97)
+			state.pixel_buffer = {reinterpret_cast<const uint8_t*>(color.data()), size_t(variant - 95) * 4};
+		const std::array<float, 3> weights {.125f, .25f, .625f};
+		if (variant == 98) {
+			const auto word = [](const float& value) {
+				return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&value), 4);
+			};
+			state.pixel_buffer = word(color[0]);
+			state.pixel_buffer2 = word(color[1]);
+			state.pixel_buffer3 = word(color[2]);
+			state.vertex_buffer = word(weights[0]);
+			state.vertex_buffer2 = word(weights[1]);
+			state.vertex_buffer3 = word(weights[2]);
+		}
+		if (variant >= 99)
+			state.pixel_buffer2 = {reinterpret_cast<const uint8_t*>(data.data()), sizeof(data)};
+		const std::array<uint32_t, 20> table {
+		    variant == 119 ? 48u : variant == 120 ? 64u :
+		        variant == 101 || variant == 104 || variant == 106 ? 16u :
+		        variant == 102 || variant == 105 ? 32u : 0u,
+		    0, 0, 0,
+		    0x210000, 16u << 16, 1, 0xfac, 0x220000, 16u << 16, 1, 0xfac,
+		    0x230000, 16u << 16, 1, 0xfac, 0x240000, 16u << 16, 1, 0xfac};
+		const std::array<float, 4> other {.75f, .25f, .5f, 1.f};
+		const std::array<float, 4> third_buffer {.5f, .75f, .25f, 1.f}, fourth_buffer {1.f, .5f, .25f, 1.f};
+		if ((variant >= 101 && variant <= 106) || variant == 119 || variant == 120) {
+			state.pixel_buffer = {reinterpret_cast<const uint8_t*>(table.data()), sizeof(table)};
+			state.pixel_buffer2 = {reinterpret_cast<const uint8_t*>(color.data()), sizeof(color)};
+			state.pixel_buffer3 = {reinterpret_cast<const uint8_t*>(other.data()), sizeof(other)};
+			state.pixel_buffer_tail[0] = {reinterpret_cast<const uint8_t*>(third_buffer.data()), sizeof(third_buffer)};
+			state.pixel_buffer_tail[1] = {reinterpret_cast<const uint8_t*>(fourth_buffer.data()), sizeof(fourth_buffer)};
+		}
+		const float ps_weight = .03125f, vs_weight = .125f;
+		std::vector<uint8_t> writable;
+		std::vector<uint8_t> storage_readback;
+		const uint32_t store_table[] {16, 0, 0, 0,
+		    0x210000, 16u << 16, 1, 0xfac, 0x220000, 16u << 16, 1, 0xfac};
+		if (variant == 121) {
+			writable.resize(64 * 32 * 4);
+			storage_readback.resize(writable.size(), 0xcd);
+			state.pixel_buffer = writable;
+			state.pixel_buffer2 = {};
+			state.pixel_storage_writes = true;
+			state.storage_readback[0] = storage_readback;
+		}
+		if (variant == 122) {
+			storage_readback.resize(sizeof(store_table), 0xcd);
+			state.pixel_buffer = {reinterpret_cast<const uint8_t*>(store_table), sizeof(store_table)};
+			state.pixel_buffer2 = {reinterpret_cast<const uint8_t*>(color.data()), sizeof(color)};
+			state.pixel_buffer3 = {reinterpret_cast<const uint8_t*>(other.data()), sizeof(other)};
+			state.pixel_storage_writes = true;
+			state.storage_readback[0] = storage_readback;
+			state.left = 16;
+			state.top = 8;
+			state.right = 17;
+			state.bottom = 9;
+		}
+		if (variant == 118) {
+			const std::span<const uint8_t> ps(reinterpret_cast<const uint8_t*>(&ps_weight), 4);
+			const std::span<const uint8_t> vs(reinterpret_cast<const uint8_t*>(&vs_weight), 4);
+			state.pixel_buffer = state.pixel_buffer2 = state.pixel_buffer3 = ps;
+			state.vertex_buffer = state.vertex_buffer2 = state.vertex_buffer3 = vs;
+			state.pixel_buffer_tail.fill(ps);
+			state.vertex_buffer_tail.fill(vs);
+		}
+		std::array<std::array<uint8_t, 256>, 4> texels {};
+		const uint32_t image_choice = variant >= 114 ? 3 + uint32_t(variant - 114) % 2 :
+		    variant >= 108 ? uint32_t(variant - 108) % 3 : 0;
+		const uint32_t image_offsets[] {16, 48, 0, 80, 112};
+		const uint32_t image_table[] {image_offsets[image_choice], 0, 0, 0,
+		    0x2100, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2200, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2300, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0,
+		    0x2400, 10u << 20, 0, 0x90800facu, 63u << 13, 0, 0, 0};
+		const std::array<float, 4> third {.5f, .75f, .25f, 1.f}, fourth {1.f, .5f, .25f, 1.f};
+		if (variant == 107) {
+			texels[0] = {64, 0, 191, 255};
+			texels[1] = {0, 0, 0, 0, 0, 128, 0, 0};
+			texels[2] = {64, 0, 0, 0};
+			texels[3] = {191, 0, 0, 0};
+			state.pixel_buffer = state.pixel_buffer2 = state.pixel_buffer3 = {};
+			state.pixel_texture = {1, 1, 256, texels[0]};
+			state.pixel_texture2 = {2, 1, 256, texels[1]};
+			state.vertex_texture = {1, 1, 256, texels[2]};
+			state.vertex_texture2 = {2, 1, 256, texels[3]};
+		}
+		if (variant >= 108 && variant <= 117) {
+			texels[0] = {64, 128, 191, 255};
+			texels[1] = {191, 64, 128, 255};
+			texels[2] = {128, 191, 64, 255};
+			texels[3] = {255, 128, 64, 255};
+			state.pixel_buffer = {reinterpret_cast<const uint8_t*>(image_table), sizeof(image_table)};
+			state.pixel_buffer2 = state.pixel_buffer3 = {};
+			state.pixel_texture = {1, 1, 256, texels[0]};
+			state.pixel_texture2 = {1, 1, 256, texels[1]};
+			state.pixel_texture_tail = {Ps4::Texture2D {1, 1, 256, texels[2]},
+			                            Ps4::Texture2D {1, 1, 256, texels[3]}};
+		}
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "body S_LOAD output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const bool inside = x >= state.left && x < state.right && y >= state.top && y < state.bottom &&
+				    x >= 8 && y >= 4 && (float(x) + .5f - 8) / 48 + (float(y) + .5f - 4) / 24 < 1;
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float shade = variant == 122 ? other[c] :
+					    variant == 119 ? third_buffer[c] : variant == 120 ? fourth_buffer[c] :
+					    variant >= 108 && variant <= 117 ? (image_choice == 4 ? fourth[c] :
+					    image_choice == 3 ? third[c] : image_choice == 2 ? 0.f :
+					    image_choice == 1 ? other[c] : color[c]) :
+					    variant == 95 || variant == 100 || variant == 103 ? 0.f :
+					    variant == 106 && c == 0 ? color[0] + other[0] :
+					    variant == 102 || variant == 105 || variant == 106 ? other[c] :
+					        (variant >= 96 && variant <= 97 && c == 2 ? .5f : color[c]);
+					const float expected = inside ? shade : (c == 3 ? 1.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) -
+					                 int(std::lround(expected * 255))) <= 1, "body S_LOAD pixel");
+					if (variant == 121) {
+						const uint8_t rgba[] {64, 128, 191, 255};
+						Require(storage_readback[(y * 64 + x) * 4 + c] == (inside ? rgba[c] : 0),
+						        "PS4 shader storage readback");
+					}
+				}
+			}
+		std::printf("PS4_RASTER %s body S_LOAD variant=%d all=2048 PASS\n", backend, variant);
+		if (variant == 122) {
+			auto expected = std::array<uint32_t, std::size(store_table)> {};
+			std::copy(std::begin(store_table), std::end(store_table), expected.begin());
+			expected[0] = 32;
+			Require(std::memcmp(storage_readback.data(), expected.data(), sizeof(expected)) == 0,
+			        "GCN SRT selector readback");
+		}
+	}
 	Ps4::RasterState state;
 	state.alpha_blend = true;
 	const Ps4::LinearTarget target {0x8000, state.width, state.height, state.width * 4};
@@ -595,7 +747,11 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint8_t>(
-				        folder / (variant >= 74                    ? "gcn-interp.vert.dxil"
+				        folder / (variant == 118                   ? "gcn-eight.vert.dxil"
+				                  : variant == 107                   ? "gcn-two-images.vert.dxil"
+				                  : variant == 98                    ? "gcn-three.vert.dxil"
+				                  : variant >= 93                    ? "gcn-small.vert.dxil"
+				                  : variant >= 74                    ? "gcn-interp.vert.dxil"
 				                  : variant >= 70                    ? "gcn-external-fetch.vert.dxil"
 				                  : variant >= 65                    ? "gcn-interp.vert.dxil"
 				                  : variant >= 62                    ? "gcn-table-sample.vert.dxil"
@@ -612,8 +768,26 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.dxil"
 				                                                   : "gcn-small.vert.dxil"));
 				    const auto ps = Read<uint8_t>(
-				        folder / (variant == 89                    ? "gcn-cfg-exit0.frag.dxil"
+				        folder / (variant == 122                   ? "gcn-srt-store.frag.dxil"
+				                  : variant == 121                   ? "gcn-raster-storage.frag.dxil"
+				                  : variant >= 119                   ? "gcn-mubuf-table.frag.dxil"
+				                  : variant == 118                   ? "gcn-eight.frag.dxil"
+				                  : variant >= 116 || (variant >= 111 && variant <= 113) ? "gcn-image-srt-sample.frag.dxil"
+				                  : variant >= 108                   ? "gcn-image-srt-load.frag.dxil"
+				                  : variant == 107                   ? "gcn-two-images.frag.dxil"
+				                  : variant == 106                   ? "gcn-mubuf-loop.frag.dxil"
+				                  : variant >= 104                   ? "gcn-mubuf-join.frag.dxil"
+				                  : variant >= 101                   ? "gcn-mubuf-table.frag.dxil"
+				                  : variant >= 99                    ? "gcn-mubuf-soffset.frag.dxil"
+				                  : variant == 98                    ? "gcn-three.frag.dxil"
+				                  : variant == 96                    ? "gcn-raw-short1.frag.dxil"
+				                  : variant == 97                    ? "gcn-raw-short2.frag.dxil"
+				                  : variant >= 94                    ? "gcn-raw-sgpr.frag.dxil"
+				                  : variant == 93                    ? "gcn-raw-load.frag.dxil"
+				                  : variant == 89                    ? "gcn-cfg-exit0.frag.dxil"
 				                  : variant == 90                    ? "gcn-cfg-exit1.frag.dxil"
+				                  : variant == 91                    ? "gcn-cfg-frame0.frag.dxil"
+				                  : variant == 92                    ? "gcn-cfg-frame1.frag.dxil"
 				                  : variant == 82                    ? "gcn-icmp0.frag.dxil"
 				                  : variant == 83                    ? "gcn-icmp1.frag.dxil"
 				                  : variant == 84                    ? "gcn-icmp2.frag.dxil"
@@ -745,7 +919,11 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint32_t>(
-				        folder / (variant >= 74                    ? "gcn-interp.vert.spv"
+				        folder / (variant == 118                   ? "gcn-eight.vert.spv"
+				                  : variant == 107                   ? "gcn-two-images.vert.spv"
+				                  : variant == 98                    ? "gcn-three.vert.spv"
+				                  : variant >= 93                    ? "gcn-small.vert.spv"
+				                  : variant >= 74                    ? "gcn-interp.vert.spv"
 				                  : variant >= 70                    ? "gcn-external-fetch.vert.spv"
 				                  : variant >= 65                    ? "gcn-interp.vert.spv"
 				                  : variant >= 62                    ? "gcn-table-sample.vert.spv"
@@ -762,8 +940,26 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.spv"
 				                                                   : "gcn-small.vert.spv"));
 				    const auto ps = Read<uint32_t>(
-				        folder / (variant == 89                    ? "gcn-cfg-exit0.frag.spv"
+				        folder / (variant == 122                   ? "gcn-srt-store.frag.spv"
+				                  : variant == 121                   ? "gcn-raster-storage.frag.spv"
+				                  : variant >= 119                   ? "gcn-mubuf-table.frag.spv"
+				                  : variant == 118                   ? "gcn-eight.frag.spv"
+				                  : variant >= 116 || (variant >= 111 && variant <= 113) ? "gcn-image-srt-sample.frag.spv"
+				                  : variant >= 108                   ? "gcn-image-srt-load.frag.spv"
+				                  : variant == 107                   ? "gcn-two-images.frag.spv"
+				                  : variant == 106                   ? "gcn-mubuf-loop.frag.spv"
+				                  : variant >= 104                   ? "gcn-mubuf-join.frag.spv"
+				                  : variant >= 101                   ? "gcn-mubuf-table.frag.spv"
+				                  : variant >= 99                    ? "gcn-mubuf-soffset.frag.spv"
+				                  : variant == 98                    ? "gcn-three.frag.spv"
+				                  : variant == 96                    ? "gcn-raw-short1.frag.spv"
+				                  : variant == 97                    ? "gcn-raw-short2.frag.spv"
+				                  : variant >= 94                    ? "gcn-raw-sgpr.frag.spv"
+				                  : variant == 93                    ? "gcn-raw-load.frag.spv"
+				                  : variant == 89                    ? "gcn-cfg-exit0.frag.spv"
 				                  : variant == 90                    ? "gcn-cfg-exit1.frag.spv"
+				                  : variant == 91                    ? "gcn-cfg-frame0.frag.spv"
+				                  : variant == 92                    ? "gcn-cfg-frame1.frag.spv"
 				                  : variant == 82                    ? "gcn-icmp0.frag.spv"
 				                  : variant == 83                    ? "gcn-icmp1.frag.spv"
 				                  : variant == 84                    ? "gcn-icmp2.frag.spv"

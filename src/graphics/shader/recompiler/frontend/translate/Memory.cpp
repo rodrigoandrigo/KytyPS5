@@ -355,9 +355,15 @@ IR::Value Translator::NarrowSubdword(IR::U32 value, uint32_t bits) {
 }
 
 void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
-	const auto memory = MemoryInfoFromDecoded(inst);
-	const auto resource =
-	    raw ? GetScalarAddressResource(RawScalarLoadBase(inst.src0)) : GetBufferResource(memory);
+	auto memory = MemoryInfoFromDecoded(inst);
+	const bool explicit_range = !raw && inst.src_count == 4;
+	if (explicit_range) memory.resource = 0;
+	const auto resource = raw ? GetScalarAddressResource(RawScalarLoadBase(inst.src0))
+	                      : explicit_range
+	                          ? ir.Emit(IR::ValueOpcode::GetBufferResource,
+	                                    {ReadU32(inst.src2), ReadU32(inst.src3),
+	                                     ReadU32(inst.src0), IR::Value(0xfacu)})
+	                          : GetBufferResource(memory);
 	const auto                offset = ReadU32(inst.src1);
 	std::array<IR::Value, 16> loaded {};
 	for (uint32_t component = 0; component < memory.data_dwords; component++) {
@@ -403,8 +409,32 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 			EXIT("opcode %s at pc 0x%08x has unsupported buffer load width %u",
 			     Decoder::InstructionToString(inst).c_str(), inst.pc, bits);
 	}
-	const auto resource = GetBufferResource(memory);
 	const auto address  = ReadBufferAddress(inst, 0);
+	if (inst.family == Decoder::Family::MUBUF && inst.image_nsa_dwords) {
+		std::array<IR::U32, 4> selected {};
+		for (auto& value : selected) value = IR::U32(IR::Value(0u));
+		for (uint32_t candidate = 0; candidate < inst.image_nsa_dwords; ++candidate) {
+			const auto& packed = inst.gcn_buffer_candidates[candidate];
+			const uint32_t words[] {packed[0], packed[1], packed[2], 0xfacu};
+			IR::U1 match(IR::Value(true));
+			for (uint32_t n = 0; n < 4; ++n)
+				match = ir.LogicalAnd(match, ir.IEqual(ReadScalarCode(inst.src1.reg + n),
+				                                      IR::U32(IR::Value(words[n]))));
+			const auto resource = ir.Emit(IR::ValueOpcode::GetBufferResource,
+			    {IR::Value(words[0]), IR::Value(words[1]), IR::Value(words[2]), IR::Value(words[3])});
+			const auto loaded = ir.Emit(opcode,
+			    {resource, address.index, address.offset, address.soffset, ir.LogicalAnd(ir.GetExec(), match)},
+			    AddMemoryInfo(memory, inst.pc));
+			for (uint32_t n = 0; n < memory.data_dwords; ++n) {
+				const auto value = memory.data_dwords == 1 ? IR::U32(loaded) : ir.CompositeExtract(loaded, n);
+				selected[n] = ir.Select(match, value, selected[n]);
+			}
+		}
+		for (uint32_t n = 0; n < memory.data_dwords; ++n)
+			WriteOperand(OffsetOperand(inst.dst, n), selected[n]);
+		return;
+	}
+	const auto resource = GetBufferResource(memory);
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(memory, inst.pc));
@@ -633,11 +663,42 @@ void Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 }
 
 void Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
+	if (inst.secondary_offset) return GcnImageCandidates(inst, false);
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
 	const auto result   = ir.Emit(IR::ValueOpcode::ImageRead, {resource, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
+	WriteImageComponents(inst.dst, result, memory, 4u);
+}
+
+void Translator::GcnImageCandidates(const Decoder::Instruction& inst, bool sampled) {
+	auto memory = MemoryInfoFromDecoded(inst);
+	memory.secondary_offset = 0;
+	const auto address = MakeImageAddress(inst, MemorySourceAt(inst, 0));
+	const auto sampler = sampled ? GetSamplerResource(memory) : IR::Value {};
+	const IR::U32 zero(IR::Value(0u));
+	std::array<IR::U32, 4> selected {zero, zero, zero, zero};
+	for (uint32_t i = 0; i < inst.secondary_offset; ++i) {
+		const auto& packed = inst.gcn_image_candidates[i];
+		const uint32_t words[] {packed[0], 10u << 20, packed[1], 0x90800facu, packed[2], 0, 0, 0};
+		IR::U1 match(IR::Value(true));
+		for (uint32_t n = 0; n < 8; ++n)
+			match = ir.LogicalAnd(match, ir.IEqual(ReadScalarCode(inst.src1.reg + n),
+			                                      IR::U32(IR::Value(words[n]))));
+		const auto resource = ir.Emit(IR::ValueOpcode::GetImageResource,
+		    {IR::Value(words[0]), IR::Value(words[1]), IR::Value(words[2]), IR::Value(words[3]),
+		     IR::Value(words[4]), IR::Value(0u), IR::Value(0u), IR::Value(0u)});
+		const auto active = ir.LogicalAnd(ir.GetExec(), match);
+		const auto flags = AddMemoryInfo(memory, inst.pc);
+		const auto value = sampled
+		    ? ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address, active}, flags)
+		    : ir.Emit(IR::ValueOpcode::ImageRead, {resource, address, active}, flags);
+		for (uint32_t n = 0; n < 4; ++n)
+			selected[n] = ir.Select(match, ir.CompositeExtract(value, n), selected[n]);
+	}
+	const auto result = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
+	                            {selected[0], selected[1], selected[2], selected[3]});
 	WriteImageComponents(inst.dst, result, memory, 4u);
 }
 
@@ -651,6 +712,7 @@ void Translator::IMAGE_STORE(const Decoder::Instruction& inst) {
 }
 
 void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
+	if (inst.secondary_offset) return GcnImageCandidates(inst, true);
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);

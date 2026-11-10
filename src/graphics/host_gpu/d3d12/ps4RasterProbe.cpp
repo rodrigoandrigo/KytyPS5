@@ -30,15 +30,23 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		D3D12_ROOT_PARAMETER parameters[4] {};
 		parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		parameters[0].Constants     = {0, 1001, 12};
-		D3D12_DESCRIPTOR_RANGE ranges[2] {};
-		ranges[0]                     = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 58, 0, 0};
-		ranges[1]                     = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 64, 0, 0};
+		const auto writable_buffer = [&](UINT slot) {
+			return slot < Ps4::BuffersPerStage ? s.pixel_storage_writes : s.vertex_storage_writes;
+		};
+		D3D12_DESCRIPTOR_RANGE ranges[3] {};
+		for (UINT stage = 0; stage < 2; ++stage) {
+			const UINT first = stage * Ps4::BuffersPerStage;
+			ranges[stage] = {writable_buffer(first) ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+			                                       : D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+			                 Ps4::BuffersPerStage, Ps4::BufferBinding + first, 0, first};
+		}
+		ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2 * Ps4::ImagesPerStage, Ps4::ImageBinding, 0, 0};
 		parameters[1].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		parameters[1].DescriptorTable = {1, &ranges[0]};
+		parameters[1].DescriptorTable = {2, &ranges[0]};
 		parameters[2].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-		parameters[2].Constants       = {0, 1000, 8};
+		parameters[2].Constants       = {0, 1000, 2 * Ps4::BufferMetadataDwords};
 		parameters[3].ParameterType   = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		parameters[3].DescriptorTable = {1, &ranges[1]};
+		parameters[3].DescriptorTable = {1, &ranges[2]};
 		D3D12_ROOT_SIGNATURE_DESC root_desc {};
 		root_desc.NumParameters = has_resources ? 4 : 1;
 		root_desc.pParameters   = parameters;
@@ -53,7 +61,7 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			sampler.MaxAnisotropy = 1;
 			sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
 			sampler.MinLOD = sampler.MaxLOD = 0;
-			sampler.ShaderRegister = 66 + stage;
+			sampler.ShaderRegister = Ps4::SamplerBinding + stage;
 			sampler.ShaderVisibility = stage ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
 		}
 		root_desc.NumStaticSamplers = 2;
@@ -152,24 +160,38 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		            "Create raster RTV heap");
 		const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
 		device->CreateRenderTargetView(target.Get(), nullptr, rtv);
-		ComPtr<ID3D12Resource>         shader_buffer[4], shader_upload[4];
+		ComPtr<ID3D12Resource>         shader_buffer[2 * Ps4::BuffersPerStage], shader_upload[2 * Ps4::BuffersPerStage];
+		ComPtr<ID3D12Resource> shader_readback[2 * Ps4::BuffersPerStage];
 		ComPtr<ID3D12DescriptorHeap>   shader_heap;
-		const std::span<const uint8_t> payloads[]   = {s.pixel_buffer, s.pixel_buffer2,
-		                                               s.vertex_buffer, s.vertex_buffer2};
-		const UINT                     buffer_count = 4;
+		const auto payloads = Ps4::RasterBuffers(s);
+		const UINT buffer_count = UINT(payloads.size());
 		const UINT                     increment =
 		    device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		const auto make_uav = [&](ID3D12Resource* resource, UINT slot, UINT elements) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+			uav.Format = DXGI_FORMAT_R32_TYPELESS;
+			uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+			uav.Buffer.NumElements = elements;
+			uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+			auto handle = shader_heap->GetCPUDescriptorHandleForHeapStart();
+			handle.ptr += SIZE_T(slot) * increment;
+			device->CreateUnorderedAccessView(resource, nullptr, &uav, handle);
+		};
 		if (has_resources) {
 			D3D12_DESCRIPTOR_HEAP_DESC views {};
 			views.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-			views.NumDescriptors = 6;
+			views.NumDescriptors = buffer_count + 2 * Ps4::ImagesPerStage;
 			views.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 			CheckRaster(device->CreateDescriptorHeap(&views, IID_PPV_ARGS(&shader_heap)),
 			            "Create resource SRV heap");
-			for (UINT i = 0; i < 6; ++i) {
+			for (UINT i = 0; i < views.NumDescriptors; ++i) {
+				if (i < buffer_count && writable_buffer(i)) {
+					make_uav(nullptr, i, 4);
+					continue;
+				}
 				D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
 				srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-				if (i < 4) {
+				if (i < buffer_count) {
 					srv.Format             = DXGI_FORMAT_R32_TYPELESS;
 					srv.ViewDimension      = D3D12_SRV_DIMENSION_BUFFER;
 					srv.Buffer.NumElements = 4;
@@ -196,10 +218,12 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			desc.DepthOrArraySize = desc.MipLevels = 1;
 			desc.SampleDesc.Count                  = 1;
 			desc.Layout                            = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+			if (writable_buffer(i)) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 			CheckRaster(device->CreateCommittedResource(&gpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
 			                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
 			                                            IID_PPV_ARGS(&shader_buffer[i])),
 			            "Create shader buffer");
+			desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 			CheckRaster(device->CreateCommittedResource(&cpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
 			                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
 			                                            IID_PPV_ARGS(&shader_upload[i])),
@@ -209,6 +233,17 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			CheckRaster(shader_upload[i]->Map(0, &empty, &data), "Map shader buffer");
 			std::memcpy(data, payloads[i].data(), payloads[i].size());
 			shader_upload[i]->Unmap(0, nullptr);
+			if (writable_buffer(i)) {
+				make_uav(shader_buffer[i].Get(), i, UINT(payloads[i].size() / 4));
+				if (!s.storage_readback[i].empty()) {
+					cpu_heap.Type = D3D12_HEAP_TYPE_READBACK;
+					CheckRaster(device->CreateCommittedResource(&cpu_heap, D3D12_HEAP_FLAG_NONE, &desc,
+					                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+					                                            IID_PPV_ARGS(&shader_readback[i])),
+					            "Create PS4 shader readback");
+				}
+				continue;
+			}
 			D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
 			srv.Format                  = DXGI_FORMAT_R32_TYPELESS;
 			srv.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
@@ -221,10 +256,10 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			device->CreateShaderResourceView(shader_buffer[i].Get(), &srv, handle);
 		}
 
-		ComPtr<ID3D12Resource>             textures[2], texture_uploads[2];
-		D3D12_PLACED_SUBRESOURCE_FOOTPRINT texture_footprints[2] {};
-		const Ps4::Texture2D               image_payloads[] = {s.pixel_texture, s.vertex_texture};
-		for (UINT i = 0; i < 2; ++i) {
+		ComPtr<ID3D12Resource>             textures[2 * Ps4::ImagesPerStage], texture_uploads[2 * Ps4::ImagesPerStage];
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT texture_footprints[2 * Ps4::ImagesPerStage] {};
+		const auto image_payloads = Ps4::RasterImages(s);
+		for (UINT i = 0; i < image_payloads.size(); ++i) {
 			const auto& t = image_payloads[i];
 			if (t.pixels.empty()) continue;
 			D3D12_RESOURCE_DESC desc {};
@@ -269,7 +304,7 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			srv.Texture2D.MipLevels     = 1;
 			auto handle                 = shader_heap->GetCPUDescriptorHandleForHeapStart();
-			handle.ptr += SIZE_T(4 + i) * increment;
+			handle.ptr += SIZE_T(buffer_count + i) * increment;
 			device->CreateShaderResourceView(textures[i].Get(), &srv, handle);
 		}
 		ComPtr<ID3D12CommandAllocator>    allocator;
@@ -295,6 +330,7 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 				D3D12_RESOURCE_BARRIER barrier {};
 				barrier.Type       = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 				barrier.Transition = {shader_buffer[i].Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST,
+				                      writable_buffer(i) ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS :
 				                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
 				                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
 				list->ResourceBarrier(1, &barrier);
@@ -304,13 +340,11 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			list->SetGraphicsRootDescriptorTable(1,
 			                                     shader_heap->GetGPUDescriptorHandleForHeapStart());
 			auto image_table = shader_heap->GetGPUDescriptorHandleForHeapStart();
-			image_table.ptr += UINT64(4) * increment;
+			image_table.ptr += UINT64(buffer_count) * increment;
 			list->SetGraphicsRootDescriptorTable(3, image_table);
-			const uint32_t metadata[] = {
-			    0, uint32_t(s.pixel_buffer.size()),  uint32_t(s.pixel_buffer2.size()),  0,
-			    0, uint32_t(s.vertex_buffer.size()), uint32_t(s.vertex_buffer2.size()), 0};
-			list->SetGraphicsRoot32BitConstants(2, 8, metadata, 0);
-			for (UINT i = 0; i < 2; ++i) {
+			const auto metadata = Ps4::RasterBufferMetadata(s);
+			list->SetGraphicsRoot32BitConstants(2, UINT(metadata.size()), metadata.data(), 0);
+			for (UINT i = 0; i < image_payloads.size(); ++i) {
 				if (!textures[i]) continue;
 				D3D12_TEXTURE_COPY_LOCATION src {}, dst {};
 				src.pResource       = texture_uploads[i].Get();
@@ -387,6 +421,15 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 		dest.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 		dest.PlacedFootprint = footprint;
 		list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+		for (UINT i = 0; i < buffer_count; ++i) {
+			if (!shader_readback[i]) continue;
+			D3D12_RESOURCE_BARRIER barrier {};
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barrier.Transition = {shader_buffer[i].Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			                      D3D12_RESOURCE_STATE_COPY_SOURCE};
+			list->ResourceBarrier(1, &barrier);
+			list->CopyBufferRegion(shader_readback[i].Get(), 0, shader_buffer[i].Get(), 0, payloads[i].size());
+		}
 		CheckRaster(list->Close(), "Close raster list");
 		ID3D12CommandList* lists[] {list.Get()};
 		queue->ExecuteCommandLists(1, lists);
@@ -412,6 +455,20 @@ bool RasterizePs4Probe(ID3D12Device* device, ID3D12CommandQueue* queue, const Ps
 			                size_t(y) * footprint.Footprint.RowPitch,
 			            size_t(s.width) * 4);
 		readback->Unmap(0, &no_write);
+		std::array<std::vector<uint8_t>, 2 * Ps4::BuffersPerStage> storage;
+		for (UINT i = 0; i < buffer_count; ++i) {
+			if (!shader_readback[i]) continue;
+			storage[i].resize(payloads[i].size());
+			D3D12_RANGE read_range {0, storage[i].size()};
+			void* data;
+			CheckRaster(shader_readback[i]->Map(0, &read_range, &data), "Map PS4 shader readback");
+			std::memcpy(storage[i].data(), data, storage[i].size());
+			const D3D12_RANGE empty {};
+			shader_readback[i]->Unmap(0, &empty);
+		}
+		for (UINT i = 0; i < buffer_count; ++i)
+			if (!storage[i].empty())
+				std::memcpy(s.storage_readback[i].data(), storage[i].data(), storage[i].size());
 		image = std::move(pixels);
 		return true;
 	} catch (const std::exception& e) {

@@ -172,7 +172,7 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 	struct Effects {
 		bool scc_read = false, scc_write = false;
 		bool vcc_read = false, vcc_write = false, mask_save = false, mask_restore = false;
-		bool mask_else = false, mask_branch = false;
+		bool mask_branch = false;
 	};
 	std::vector<Effects>       effects;
 	std::map<uint32_t, size_t> boundaries;
@@ -242,16 +242,21 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 		} else if ((word & 0xff800000u) == 0xbe800000u) {
 			inst.family    = Family::SOP1;
 			inst.opcode_id = (word >> 8) & 255;
-			if (inst.opcode_id == 36) {
+			if (inst.opcode_id >= 36 && inst.opcode_id <= 43) {
+				constexpr Opcode save_exec[] {
+				    Opcode::S_AND_SAVEEXEC_B64, Opcode::S_OR_SAVEEXEC_B64,
+				    Opcode::S_XOR_SAVEEXEC_B64, Opcode::S_ANDN2_SAVEEXEC_B64,
+				    Opcode::S_ORN2_SAVEEXEC_B64, Opcode::S_NAND_SAVEEXEC_B64,
+				    Opcode::S_NOR_SAVEEXEC_B64, Opcode::S_XNOR_SAVEEXEC_B64};
 				const uint32_t dst = (word >> 16) & 127;
-				if (dst % 2 || dst > 102 || (word & 255) != 106)
-					return fail(pc, "SAVEEXEC requires aligned SGPR pair and VCC source");
-				inst.opcode = Opcode::S_AND_SAVEEXEC_B64;
+				if (dst % 2 || dst > 102 || !ScalarPair(word & 255, inst.src0))
+					return fail(pc, "SAVEEXEC requires aligned scalar register pairs");
+				inst.opcode = save_exec[inst.opcode_id - 36];
 				scalar_dst(dst);
-				inst.src0.kind = OperandKind::VccLo;
 				inst.src_count = 1;
 				inst.data_dwords = 2;
-				effect.mask_save = effect.vcc_read = effect.scc_write = true;
+				effect.mask_save = effect.scc_write = true;
+				effect.vcc_read = inst.src0.kind == OperandKind::VccLo;
 			} else if (inst.opcode_id == 4) {
 				const uint32_t dst = (word >> 16) & 127, src = word & 255;
 				if (!ScalarPair(dst, inst.dst) || !ScalarPair(src, inst.src0))
@@ -338,18 +343,7 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			}
 			effect.scc_write = inst.opcode_id != 10 && inst.opcode_id != 38;
 			inst.src_count   = 2;
-			if (inst.opcode == Opcode::S_XOR_B64 && ((word >> 16) & 127) == 126 &&
-			    ((word >> 8) & 255) == 126 && (word & 255) <= 102) {
-				effect.mask_else = true;
-				const uint32_t saved = word & 255;
-				if (((word >> 16) & 127) != 126 || ((word >> 8) & 255) != 126 ||
-				    saved > 102 || saved % 2)
-					return fail(pc, "mask else requires XOR EXEC,saved_pair,EXEC");
-				inst.dst.kind = inst.src1.kind = OperandKind::ExecLo;
-				inst.src0.kind = OperandKind::Sgpr;
-				inst.src0.reg = saved;
-				inst.data_dwords = 2;
-			} else if (inst.data_dwords == 2) {
+			if (inst.data_dwords == 2) {
 				const uint32_t dst = (word >> 16) & 127, lhs = word & 255, rhs = (word >> 8) & 255;
 				if (!ScalarPair(dst, inst.dst) || !ScalarPair(lhs, inst.src0) ||
 				    !ScalarPair(rhs, inst.src1))
@@ -363,11 +357,12 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			const uint32_t op = (word >> 22) & 31, base = ((word >> 9) & 63) * 2,
 			               dst = (word >> 15) & 127;
 			// GCN SMRD opcodes 8..12 encode DWORD through DWORDX16. The
-			// shared memory translator already handles all five widths. Keep
-			// offsets immediate and descriptors direct; raw S_LOAD is separate.
+			// Immediate offsets are in DWORDs. Register offsets are byte addresses.
 			const bool raw = op <= 4;
+			const bool immediate = (word & 0x100) != 0;
 			const uint32_t count = raw ? 1u << op : (op >= 8 && op <= 12 ? 1u << (op - 8) : 0);
-			if (!count || !(word & 0x100) || base + (raw ? 2u : 4u) > 104 ||
+			if (!count || (!immediate && (word & 255) >= 104) ||
+			    base + (raw ? 2u : 4u) > 104 ||
 			    (!raw && (base % 4 || dst < 4)) || dst + count > 104)
 				return fail(pc, "unsupported SMRD stage/opcode/descriptor/offset/destination");
 			inst.family    = Family::SMEM;
@@ -382,8 +377,13 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			scalar_dst(dst);
 			inst.src0.kind   = OperandKind::Sgpr;
 			inst.src0.reg    = base;
-			inst.src1.kind   = OperandKind::LiteralConstant;
-			inst.src1.value  = (word & 255) * 4;
+			if (immediate) {
+				inst.src1.kind = OperandKind::LiteralConstant;
+				inst.src1.value = (word & 255) * 4;
+			} else {
+				inst.src1.kind = OperandKind::Sgpr;
+				inst.src1.reg = word & 255;
+			}
 			inst.src_count   = 2;
 			inst.data_dwords = count;
 			inst.data_bits   = 32;
@@ -450,25 +450,35 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 		} else if ((word & 0xfc000000u) == 0xe0000000u) {
 			if (next == code.size()) return fail(pc, "truncated GCN MUBUF");
 			const uint32_t operand = code[next++], op = (word >> 18) & 127;
-			const uint32_t count = op == 12 ? 1 : op == 13 ? 2 : op == 15 ? 3 : 4,
+			const bool store = op >= 28 && op <= 31;
+			const uint32_t width_op = store ? op - 16 : op;
+			const uint32_t count = width_op == 12 ? 1 : width_op == 13 ? 2 : width_op == 15 ? 3 : 4,
 			               dst = (operand >> 8) & 255;
 			const uint32_t base = ((operand >> 16) & 31) * 4;
+			const uint32_t soffset = operand >> 24;
 			// IDXEN only; no OFFEN/ADDR64/cache/TFE/LDS/swizzle extensions.
-			if ((op < 12 || op > 15) || (word & ~0xe1fc2fffu) || !(word & 0x2000) || (word & 3) ||
-			    (operand & 0x00e00000u) || (operand >> 24) != 128 || base + 4 > 104 || dst + count > 256)
+			if ((!store && (op < 12 || op > 15)) || (word & ~0xe1fc2fffu) || !(word & 0x2000) || (word & 3) ||
+			    (operand & 0x00e00000u) || (soffset >= 104 && soffset != 128) ||
+			    base + 4 > 104 || dst + count > 256)
 				return fail(pc, "unsupported MUBUF opcode/controls/descriptor/register range");
 			inst.family      = Family::MUBUF;
-			inst.opcode      = op == 12 ? Opcode::BUFFER_LOAD_DWORD :
-			                   op == 13 ? Opcode::BUFFER_LOAD_DWORDX2 :
-			                   op == 15 ? Opcode::BUFFER_LOAD_DWORDX3 : Opcode::BUFFER_LOAD_DWORDX4;
+			constexpr Opcode loads[] {Opcode::BUFFER_LOAD_DWORD, Opcode::BUFFER_LOAD_DWORDX2,
+			                          Opcode::BUFFER_LOAD_DWORDX4, Opcode::BUFFER_LOAD_DWORDX3};
+			constexpr Opcode stores[] {Opcode::BUFFER_STORE_DWORD, Opcode::BUFFER_STORE_DWORDX2,
+			                           Opcode::BUFFER_STORE_DWORDX4, Opcode::BUFFER_STORE_DWORDX3};
+			inst.opcode = store ? stores[width_op - 12] : loads[width_op - 12];
 			inst.opcode_id   = op;
 			inst.dst         = Vector(dst);
 			inst.src0        = Vector(operand & 255);
 			inst.src1.kind   = OperandKind::Sgpr;
 			inst.src1.reg    = base;
-			inst.src2.kind   = OperandKind::IntegerInlineConstant;
-			inst.src2.value  = 0;
+			if (!source(soffset, inst.src2))
+				return fail(pc, "invalid MUBUF scalar byte offset");
 			inst.src_count   = 3;
+			if (store) {
+				inst.src3 = inst.dst; // Stores read VDATA rather than defining a VGPR.
+				inst.src_count = 4;
+			}
 			inst.offset      = word & 4095;
 			inst.idxen       = true;
 			inst.data_dwords = count;
@@ -765,28 +775,17 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				return fail(inst.pc / 4, "branch into interpolation pair");
 		}
 		auto          flow = *incoming[i];
-		if (branch && !flow.masks.empty() && !effects[i].mask_branch && !effects[i].scc_read)
-			return fail(inst.pc / 4, "unconditional branch inside an EXEC frame");
 		const auto& effect = effects[i];
 		const auto has_entry_pair = [&](uint32_t reg) {
 			return flow.entry_exec_words[0][reg] && flow.entry_exec_words[1][reg + 1];
 		};
-		if (effect.mask_else) {
-			if (!flow.masks.empty()) {
-				if (flow.masks.back() != inst.src0.reg)
-					return fail(inst.pc / 4, "else requires the unchanged top saved pair exactly once");
-				flow.masks.back() |= 256; // Frame phase, not a physical SGPR bit.
-			} else if (!has_entry_pair(inst.src0.reg)) {
-				return fail(inst.pc / 4, "else requires an unchanged saved EXEC pair");
-			}
-		}
 		if (effect.vcc_read && (!flow.defined[Vcc] || !flow.defined[VccHi]))
 			return fail(inst.pc / 4, "undefined VCC");
 		const bool writes_exec = inst.gcn_cmpx_updates_vcc_exec ||
 		    inst.dst.kind == OperandKind::ExecLo || inst.dst.kind == OperandKind::ExecHi;
 		if (effect.mask_restore) {
 			if (!flow.masks.empty()) {
-				if ((flow.masks.back() & 127) != inst.src0.reg)
+				if (flow.masks.back() != inst.src0.reg)
 					return fail(inst.pc / 4, "EXEC restore does not match innermost saved pair");
 				flow.masks.pop_back();
 			} else {
@@ -816,7 +815,6 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 		if (inst.dst.kind == OperandKind::Sgpr) {
 			const uint32_t count = inst.family == Family::VOPC ? 2 : inst.data_dwords;
 			for (uint32_t saved: flow.masks) {
-				saved &= 127;
 				if (inst.dst.reg < saved + 2 && saved < inst.dst.reg + count)
 					return fail(inst.pc / 4, "overwriting active saved EXEC pair");
 			}
@@ -844,7 +842,7 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				return fail(inst.pc / 4, "read of undefined register on a control-flow path");
 			const bool pair_read =
 			    (inst.data_dwords == 2 &&
-			     (inst.family == Family::SOP2 || inst.opcode == Opcode::S_MOV_B64)) ||
+			     (inst.family == Family::SOP2 || inst.family == Family::SOP1)) ||
 			    CompareSourcePair(inst, n);
 			if (pair_read && source.kind == OperandKind::VccLo && !flow.defined[VccHi])
 				return fail(inst.pc / 4, "read of undefined upper VCC in 64-bit operand");
@@ -874,7 +872,13 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 						return fail(inst.pc / 4, "undefined sampler descriptor SGPR");
 		}
 		if (effects[i].scc_read && !flow.defined[Scc]) return fail(inst.pc / 4, "undefined SCC");
-		if (inst.dst.kind == OperandKind::Vgpr) {
+		const bool buffer_store = inst.family == Family::MUBUF &&
+		    inst.opcode_id >= 28 && inst.opcode_id <= 31;
+		if (buffer_store)
+			for (uint32_t n = 1; n < inst.data_dwords; ++n)
+				if (!flow.defined[inst.dst.reg + n])
+					return fail(inst.pc / 4, "undefined MUBUF store VDATA group");
+		if (inst.dst.kind == OperandKind::Vgpr && !buffer_store) {
 			if (stage == Stage::Pixel && parameter_count && inst.dst.reg < 2)
 				return fail(inst.pc / 4, "overwriting interpolation coordinates is unsupported");
 			if (inst.opcode != Opcode::V_INTERP_P1_F32)
