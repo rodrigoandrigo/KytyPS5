@@ -1,5 +1,27 @@
 # Compatibilidade PS4 — estado e auditoria
 
+CMP/CMPX GCN aceita SCC, EXECZ e VCCZ como fontes e valida a definição das condições. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+CMP/CMPX GCN agora aceita constantes de 64 bits por tipo e fontes de máscara EXEC/VCC. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+O frontend GCN valida salvamento e restauração independentes de EXEC_LO/HI. O readback passou nas duas saídas em D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+O frontend GCN rastreia EXEC de entrada salvo por MOV e permite escritas diretas com restauração comprovada. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+O readback confirmou as duas saídas restauradas de um CFG GCN com escrita VALU divergente em D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+CMP/CMPX VOP3 com destino explícito foi validado por readback em D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+VOPC F16 e CLASS_F64 passaram pelos casos numéricos de readback em D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+O frontend GCN ganhou operações sobre as metades de EXEC/VCC e novos predicados VOPC. A preservação de lanes nas fixtures passou por readback D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+VOPC I64/U64, cópias de máscaras B64 e laço sob EXEC reduzido validados em 2026-11-09. O readback verificou preservação de lanes inativas em D3D12, WARP e Vulkan. [Escopo e evidências](PS4_LUMEN_INTEGRATION.md).
+
+Em 2026-11-09, o frontend GCN passou a verificar arestas de retorno no CFG. O laço escalar de teste passou no validador SPIR-V, com 10/10 testes selecionados e build UWP/D3D12 aprovados. [Limites e evidências](PS4_LUMEN_INTEGRATION.md).
+
+Em 2026-11-09, o frontend GCN ganhou desvios VCCZ/VCCNZ e EXECZ/EXECNZ para frente e cinco operações B64 entre pares SGPR. CTest 10/10 e build UWP aprovados. Loops e manipulação geral de máscaras permanecem pendentes. [Contrato e evidências](PS4_LUMEN_INTEGRATION.md).
+
 Validação atual (2026-11-08): perfis da integração Lumen passaram em10/10 testes selecionados e270 readbacks D3D12/WARP/Vulkan; [evidências e limites](PS4_LUMEN_INTEGRATION.md). Build UWP/D3D12 e auditoria de imports aprovados; sem execução Xbox. P0–P15 continua incompleto; resultados abaixo marcados como não validados são históricos.
 
 Validação liberada pelo usuário em 2026-11-08: o adiamento de testes registrado abaixo foi revogado. Reconstrução e testes dos perfis limitados concluídos; resultados novos em `PROGRESS.md` e `build/lumen-validation`. P0–P15 continua incompleto.

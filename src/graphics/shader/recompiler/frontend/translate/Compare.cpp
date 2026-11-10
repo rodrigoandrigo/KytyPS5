@@ -13,7 +13,7 @@ void Translator::EmitCompareResult(const Decoder::Instruction& inst, IR::U1 valu
 	if (inst.gcn_cmpx_updates_vcc_exec) {
 		// The incoming EXEC gates both results. Writing VCC first leaves EXEC
 		// intact for the second update; no scalar condition code is modified.
-		WriteVectorMask(ConditionOperand(Decoder::OperandKind::VccLo), value);
+		WriteVectorMask(inst.dst, value);
 		WriteVectorMask(ConditionOperand(Decoder::OperandKind::ExecLo), value);
 		return;
 	}
@@ -58,6 +58,7 @@ void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::Valu
 
 void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                   bool half) {
+	half |= inst.family == Decoder::Family::VOPC && inst.data_bits == 16;
 	const auto type = IR::ArgTypeOf(opcode, 0);
 	const auto lhs =
 	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, type);
@@ -72,14 +73,40 @@ void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool 
                                          bool is64) {
 	const auto type      = is64 ? IR::Type::F64 : IR::Type::F32;
 	const auto is_nan_op = is64 ? IR::ValueOpcode::FPIsNan64 : IR::ValueOpcode::FPIsNan32;
-	const auto lhs       = ReadOperand(inst.src0, type);
-	const auto rhs       = ReadOperand(inst.src1, type);
+	const bool half      = inst.family == Decoder::Family::VOPC && inst.data_bits == 16;
+	const auto lhs       = half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, type);
+	const auto rhs       = half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, type);
 	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(is_nan_op, {lhs})),
 	                                    IR::U1(ir.Emit(is_nan_op, {rhs})));
 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false);
 }
 
 void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool half) {
+	if (inst.family == Decoder::Family::VOPC && inst.data_bits == 64) {
+		const auto constant = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+		const auto [lo, hi] = inst.src0.kind == Decoder::OperandKind::LiteralConstant
+		    ? std::array{constant(0), constant(inst.src0.value)} : ReadU32Pair(inst.src0);
+		const auto exponent = ir.BitwiseAnd(hi, constant(0x7ff00000));
+		const auto fraction = ir.BitwiseOr(lo, ir.BitwiseAnd(hi, constant(0x000fffff)));
+		const auto is_negative = ir.INotEqual(ir.BitwiseAnd(hi, constant(0x80000000)), constant(0));
+		const auto has_fraction = ir.INotEqual(fraction, constant(0));
+		const auto is_special = ir.IEqual(exponent, constant(0x7ff00000));
+		const auto has_zero_exp = ir.IEqual(exponent, constant(0));
+		const auto is_quiet = ir.INotEqual(ir.BitwiseAnd(hi, constant(0x00080000)), constant(0));
+
+		// AMD class bits 2..9 are ordered from -infinity to +infinity.
+		const auto magnitude = ir.Select(is_special, constant(3),
+		    ir.Select(has_zero_exp, ir.Select(has_fraction, constant(1), constant(0)), constant(2)));
+		const auto signed_class = ir.Select(is_negative, ir.ISub(constant(5), magnitude),
+		    ir.IAdd(constant(6), magnitude));
+		const auto nan_class = ir.Select(is_quiet, constant(1), constant(0));
+		const auto index = ir.Select(ir.LogicalAnd(is_special, has_fraction), nan_class, signed_class);
+		const auto mask = IR::U32(ReadOperand(inst.src1, IR::Type::U32));
+		EmitCompareResult(inst, ir.INotEqual(ir.BitwiseAnd(mask,
+		    ir.ShiftLeftLogical(constant(1), index)), constant(0)), false);
+		return;
+	}
+
 	const auto value = half ? IR::Value(Read16LaneBits(inst.src0, false))
 	                        : ReadOperand(inst.src0, IR::Type::F32);
 	const auto mask = half ? IR::Value(Read16LaneBits(inst.src1, false))

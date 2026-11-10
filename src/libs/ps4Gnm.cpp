@@ -111,15 +111,25 @@ bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> us
 			error = "SMRD descriptor/destination group exceeds declared SGPR allocation";
 			return false;
 		}
-		if ((inst.opcode == ShaderRecompiler::Decoder::Opcode::S_AND_SAVEEXEC_B64 && inst.dst.reg + 2 > scalars) ||
-		    ((inst.opcode == ShaderRecompiler::Decoder::Opcode::S_MOV_B64 ||
-		      inst.opcode == ShaderRecompiler::Decoder::Opcode::S_XOR_B64) && inst.src0.reg + 2 > scalars)) {
-			error = "saved EXEC pair exceeds declared SGPR allocation";
-			return false;
-		}
 		const ShaderRecompiler::Decoder::Operand operands[] {inst.dst, inst.src0, inst.src1,
 		                                                     inst.src2, inst.src3};
 		for (const auto& op: operands) {
+			const bool paired =
+			    (inst.data_dwords == 2 &&
+			     (inst.family == ShaderRecompiler::Decoder::Family::SOP2 ||
+			      inst.family == ShaderRecompiler::Decoder::Family::VOPC ||
+			      inst.opcode == ShaderRecompiler::Decoder::Opcode::S_MOV_B64 ||
+			      inst.opcode == ShaderRecompiler::Decoder::Opcode::S_AND_SAVEEXEC_B64)) ||
+			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&
+			     (op.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && &op == &operands[0])) ||
+			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&
+			     inst.data_bits == 64 && &op == &operands[1]);
+			if (paired &&
+			    ((op.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && op.reg + 2 > scalars) ||
+			     (op.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr && op.reg + 2 > vectors))) {
+				error = "B64 register pair exceeds declared allocation";
+				return false;
+			}
 			if ((op.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr && op.reg >= vectors) ||
 			    (op.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && op.reg >= scalars)) {
 				error = "GCN register use exceeds declared RSRC1 allocation";

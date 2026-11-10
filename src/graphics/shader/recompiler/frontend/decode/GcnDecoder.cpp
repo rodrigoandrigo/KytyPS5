@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <bitset>
+#include <deque>
 #include <map>
 #include <optional>
 #include <string>
@@ -15,6 +16,32 @@ Operand Vector(uint32_t reg) {
 	op.kind = OperandKind::Vgpr;
 	op.reg  = reg;
 	return op;
+}
+bool MaskRegister(uint32_t code, Operand& operand) {
+	switch (code) {
+		case 106: operand.kind = OperandKind::VccLo; return true;
+		case 107: operand.kind = OperandKind::VccHi; return true;
+		case 126: operand.kind = OperandKind::ExecLo; return true;
+		case 127: operand.kind = OperandKind::ExecHi; return true;
+		default: return false;
+	}
+}
+bool CompareSpecialSource(uint32_t code, Operand& operand) {
+	if (MaskRegister(code, operand)) return true;
+	switch (code) {
+		case 251: operand.kind = OperandKind::VccZ; return true;
+		case 252: operand.kind = OperandKind::ExecZ; return true;
+		case 253: operand.kind = OperandKind::Scc; return true;
+		default: return false;
+	}
+}
+bool ScalarPair(uint32_t code, Operand& operand) {
+	if (code & 1) return false;
+	if (MaskRegister(code, operand)) return true;
+	if (code > 102) return false;
+	operand.kind = OperandKind::Sgpr;
+	operand.reg = code;
+	return true;
 }
 bool Source(uint32_t bits, std::span<const uint32_t> code, size_t& next, Operand& op,
             std::optional<uint32_t>& literal) {
@@ -47,6 +74,81 @@ bool Source(uint32_t bits, std::span<const uint32_t> code, size_t& next, Operand
 		              // validation.
 	return true;
 }
+// Gen4 VOP3 opcodes 0..255 use the same comparison predicate numbers as VOPC.
+bool DecodeCompareOpcode(uint32_t op, Instruction& inst) {
+	constexpr Opcode compares[] {Opcode::V_CMP_F_F32, Opcode::V_CMP_LT_F32,
+	    Opcode::V_CMP_EQ_F32, Opcode::V_CMP_LE_F32, Opcode::V_CMP_GT_F32,
+	    Opcode::V_CMP_LG_F32, Opcode::V_CMP_GE_F32, Opcode::V_CMP_O_F32,
+	    Opcode::V_CMP_U_F32, Opcode::V_CMP_NGE_F32, Opcode::V_CMP_NLG_F32,
+	    Opcode::V_CMP_NGT_F32, Opcode::V_CMP_NLE_F32, Opcode::V_CMP_NEQ_F32,
+	    Opcode::V_CMP_NLT_F32, Opcode::V_CMP_TRU_F32};
+	constexpr Opcode signed_compares[] {Opcode::V_CMP_F_I32, Opcode::V_CMP_LT_I32,
+	    Opcode::V_CMP_EQ_I32, Opcode::V_CMP_LE_I32, Opcode::V_CMP_GT_I32,
+	    Opcode::V_CMP_NE_I32, Opcode::V_CMP_GE_I32, Opcode::V_CMP_T_I32};
+	constexpr Opcode unsigned_compares[] {Opcode::V_CMP_F_U32, Opcode::V_CMP_LT_U32,
+	    Opcode::V_CMP_EQ_U32, Opcode::V_CMP_LE_U32, Opcode::V_CMP_GT_U32,
+	    Opcode::V_CMP_NE_U32, Opcode::V_CMP_GE_U32, Opcode::V_CMP_T_U32};
+	const bool cmpx = (op & 16) != 0;
+	const uint32_t base_op = op & ~16u;
+	if (base_op < 16) inst.opcode = compares[base_op];
+	else if (base_op >= 32 && base_op < 48) {
+		constexpr Opcode fp64[] {
+		    Opcode::V_CMP_F_F64, Opcode::V_CMP_LT_F64, Opcode::V_CMP_EQ_F64,
+		    Opcode::V_CMP_LE_F64, Opcode::V_CMP_GT_F64, Opcode::V_CMP_LG_F64,
+		    Opcode::V_CMP_GE_F64, Opcode::V_CMP_O_F64, Opcode::V_CMP_U_F64,
+		    Opcode::V_CMP_NGE_F64, Opcode::V_CMP_NLG_F64, Opcode::V_CMP_NGT_F64,
+		    Opcode::V_CMP_NLE_F64, Opcode::V_CMP_NEQ_F64, Opcode::V_CMP_NLT_F64,
+		    Opcode::V_CMP_TRU_F64};
+		inst.opcode = fp64[base_op - 32];
+		inst.data_dwords = 2;
+	} else if (base_op >= 128 && base_op < 136) inst.opcode = signed_compares[base_op - 128];
+	else if (base_op >= 192 && base_op < 200) inst.opcode = unsigned_compares[base_op - 192];
+	else if (!cmpx && base_op >= 200 && base_op <= 207) {
+		// The Gen4 F16 VOPC subset shares the first eight F32 predicates.
+		inst.opcode = compares[base_op - 200];
+		inst.data_bits = 16;
+	} else if (base_op == 136 || base_op == 168) {
+		inst.opcode = Opcode::V_CMP_CLASS_F32;
+		// Only the floating operand is paired. The class mask is one DWORD.
+		if (base_op == 168) inst.data_bits = 64;
+	} else if (!cmpx && base_op >= 137 && base_op <= 142) {
+		constexpr Opcode predicates[] {Opcode::V_CMP_LT_I16, Opcode::V_CMP_EQ_I16,
+		    Opcode::V_CMP_LE_I16, Opcode::V_CMP_GT_I16, Opcode::V_CMP_NE_I16,
+		    Opcode::V_CMP_GE_I16};
+		inst.opcode = predicates[base_op - 137];
+	} else if (!cmpx && base_op >= 169 && base_op <= 174) {
+		constexpr Opcode predicates[] {Opcode::V_CMP_LT_U16, Opcode::V_CMP_EQ_U16,
+		    Opcode::V_CMP_LE_U16, Opcode::V_CMP_GT_U16, Opcode::V_CMP_NE_U16,
+		    Opcode::V_CMP_GE_U16};
+		inst.opcode = predicates[base_op - 169];
+	} else if ((base_op >= 160 && base_op < 168) || (base_op >= 224 && base_op < 232)) {
+		const auto first = base_op >= 224 ? Opcode::V_CMP_F_U64 : Opcode::V_CMP_F_I64;
+		inst.opcode = static_cast<Opcode>(static_cast<uint32_t>(first) + (base_op & 7));
+		inst.data_dwords = 2;
+	} else return false;
+	inst.family = Family::VOPC;
+	inst.gcn_cmpx_updates_vcc_exec = cmpx;
+	inst.opcode_id = op;
+	inst.src_count = 2;
+	return true;
+}
+
+bool CompareSourcePair(const Instruction& inst, uint32_t source) {
+	return inst.family == Family::VOPC &&
+	       (inst.data_dwords == 2 || (inst.data_bits == 64 && source == 0));
+}
+
+bool IsValidComparePair(const Operand& operand) {
+	return (operand.kind == OperandKind::Vgpr && operand.reg < 255) ||
+	       (operand.kind == OperandKind::Sgpr && operand.reg <= 102 && !(operand.reg & 1)) ||
+	       operand.kind == OperandKind::LiteralConstant ||
+	       operand.kind == OperandKind::IntegerInlineConstant ||
+	       operand.kind == OperandKind::FloatInlineConstant ||
+	       operand.kind == OperandKind::ExecLo || operand.kind == OperandKind::VccLo ||
+	       operand.kind == OperandKind::ExecZ || operand.kind == OperandKind::VccZ ||
+	       operand.kind == OperandKind::Scc;
+}
+
 uint32_t Vop1(uint32_t op, uint32_t dst, uint32_t source) {
 	return 0x7e000000u | dst << 17 | op << 9 | source;
 }
@@ -70,7 +172,7 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 	struct Effects {
 		bool scc_read = false, scc_write = false;
 		bool vcc_read = false, vcc_write = false, mask_save = false, mask_restore = false;
-		bool mask_else = false, exec_read = false;
+		bool mask_else = false, mask_branch = false;
 	};
 	std::vector<Effects>       effects;
 	std::map<uint32_t, size_t> boundaries;
@@ -89,6 +191,12 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			inst.dst.kind = OperandKind::Sgpr;
 			inst.dst.reg  = reg;
 			return true;
+		};
+		const auto mask_dst = [&](uint32_t reg) {
+			return MaskRegister(reg, inst.dst) || scalar_dst(reg);
+		};
+		const auto mask_src = [&](uint32_t reg, Operand& operand) {
+			return MaskRegister(reg, operand) || source(reg, operand);
 		};
 		if ((word & 0xff800000u) == 0xbf800000u) {
 			inst.family       = Family::SOPP;
@@ -111,7 +219,10 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 					inst.opcode = Opcode::S_WAITCNT;
 					break;
 				case 2: inst.opcode = Opcode::S_BRANCH; break;
-				case 8: inst.opcode = Opcode::S_CBRANCH_EXECZ; effect.exec_read = true; break;
+				case 6: inst.opcode = Opcode::S_CBRANCH_VCCZ; effect.mask_branch = effect.vcc_read = true; break;
+				case 7: inst.opcode = Opcode::S_CBRANCH_VCCNZ; effect.mask_branch = effect.vcc_read = true; break;
+				case 8: inst.opcode = Opcode::S_CBRANCH_EXECZ; effect.mask_branch = true; break;
+				case 9: inst.opcode = Opcode::S_CBRANCH_EXECNZ; effect.mask_branch = true; break;
 				case 4:
 					inst.opcode     = Opcode::S_CBRANCH_SCC0;
 					effect.scc_read = true;
@@ -122,11 +233,10 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 					break;
 				default: return fail(pc, "unsupported GCN scalar control");
 			}
-			if (inst.opcode_id == 2 || inst.opcode_id == 4 || inst.opcode_id == 5 || inst.opcode_id == 8) {
+			if (inst.opcode_id == 2 || effect.scc_read || effect.mask_branch) {
 				const int64_t target = int64_t(inst.pc) + 4 + int64_t(imm) * 4;
-				// Forward control flow is finite; loops require a separate bound proof.
-				if (target < int64_t(inst.pc) + 4 || target >= int64_t(code.size_bytes()))
-					return fail(pc, "backward or out-of-range branch");
+				if (target < 0 || target >= int64_t(code.size_bytes()))
+					return fail(pc, "out-of-range branch");
 				inst.branch_target = uint32_t(target);
 			}
 		} else if ((word & 0xff800000u) == 0xbe800000u) {
@@ -143,16 +253,15 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				inst.data_dwords = 2;
 				effect.mask_save = effect.vcc_read = effect.scc_write = true;
 			} else if (inst.opcode_id == 4) {
-				const uint32_t src = word & 255;
-				if (((word >> 16) & 127) != 126 || src % 2 || src > 102)
-					return fail(pc, "mask restore requires EXEC destination and aligned saved pair");
+				const uint32_t dst = (word >> 16) & 127, src = word & 255;
+				if (!ScalarPair(dst, inst.dst) || !ScalarPair(src, inst.src0))
+					return fail(pc, "S_MOV_B64 requires a register pair");
 				inst.opcode = Opcode::S_MOV_B64;
-				inst.dst.kind = OperandKind::ExecLo;
-				inst.src0.kind = OperandKind::Sgpr;
-				inst.src0.reg = src;
 				inst.src_count = 1;
 				inst.data_dwords = 2;
-				effect.mask_restore = true;
+				effect.mask_restore = dst == 126 && inst.src0.kind == OperandKind::Sgpr;
+				effect.vcc_read = src == 106;
+				effect.vcc_write = dst == 106;
 			} else {
 				if (inst.opcode_id == 3)
 					inst.opcode = Opcode::S_MOV_B32;
@@ -161,7 +270,7 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 					effect.scc_write = true;
 				} else
 					return fail(pc, "unsupported GCN SOP1 opcode");
-				if (!scalar_dst((word >> 16) & 127) || !source(word & 255, inst.src0))
+				if (!mask_dst((word >> 16) & 127) || !mask_src(word & 255, inst.src0))
 					return fail(pc, "invalid scalar move operand");
 				inst.src_count = 1;
 			}
@@ -208,7 +317,19 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				case 14: inst.opcode = Opcode::S_AND_B32; break;
 				case 16: inst.opcode = Opcode::S_OR_B32; break;
 				case 18: inst.opcode = Opcode::S_XOR_B32; break;
-				case 19: inst.opcode = Opcode::S_XOR_B64; effect.mask_else = true; break;
+				case 15: inst.opcode = Opcode::S_AND_B64; inst.data_dwords = 2; break;
+				case 17: inst.opcode = Opcode::S_OR_B64; inst.data_dwords = 2; break;
+				case 19: inst.opcode = Opcode::S_XOR_B64; inst.data_dwords = 2; break;
+				case 20: inst.opcode = Opcode::S_ANDN2_B32; break;
+				case 21: inst.opcode = Opcode::S_ANDN2_B64; inst.data_dwords = 2; break;
+				case 22: inst.opcode = Opcode::S_ORN2_B32; break;
+				case 23: inst.opcode = Opcode::S_ORN2_B64; inst.data_dwords = 2; break;
+				case 24: inst.opcode = Opcode::S_NAND_B32; break;
+				case 25: inst.opcode = Opcode::S_NAND_B64; inst.data_dwords = 2; break;
+				case 26: inst.opcode = Opcode::S_NOR_B32; break;
+				case 27: inst.opcode = Opcode::S_NOR_B64; inst.data_dwords = 2; break;
+				case 28: inst.opcode = Opcode::S_XNOR_B32; break;
+				case 29: inst.opcode = Opcode::S_XNOR_B64; inst.data_dwords = 2; break;
 				case 30: inst.opcode = Opcode::S_LSHL_B32; break;
 				case 32: inst.opcode = Opcode::S_LSHR_B32; break;
 				case 34: inst.opcode = Opcode::S_ASHR_I32; break;
@@ -217,7 +338,9 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			}
 			effect.scc_write = inst.opcode_id != 10 && inst.opcode_id != 38;
 			inst.src_count   = 2;
-			if (effect.mask_else) {
+			if (inst.opcode == Opcode::S_XOR_B64 && ((word >> 16) & 127) == 126 &&
+			    ((word >> 8) & 255) == 126 && (word & 255) <= 102) {
+				effect.mask_else = true;
 				const uint32_t saved = word & 255;
 				if (((word >> 16) & 127) != 126 || ((word >> 8) & 255) != 126 ||
 				    saved > 102 || saved % 2)
@@ -226,8 +349,15 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				inst.src0.kind = OperandKind::Sgpr;
 				inst.src0.reg = saved;
 				inst.data_dwords = 2;
-			} else if (!scalar_dst((word >> 16) & 127) || !source(word & 255, inst.src0) ||
-			           !source((word >> 8) & 255, inst.src1))
+			} else if (inst.data_dwords == 2) {
+				const uint32_t dst = (word >> 16) & 127, lhs = word & 255, rhs = (word >> 8) & 255;
+				if (!ScalarPair(dst, inst.dst) || !ScalarPair(lhs, inst.src0) ||
+				    !ScalarPair(rhs, inst.src1))
+					return fail(pc, "B64 ALU requires aligned scalar pairs");
+				effect.vcc_read = lhs == 106 || rhs == 106;
+				effect.vcc_write = dst == 106;
+			} else if (!mask_dst((word >> 16) & 127) || !mask_src(word & 255, inst.src0) ||
+			           !mask_src((word >> 8) & 255, inst.src1))
 				return fail(pc, "invalid scalar ALU operand");
 		} else if ((word & 0xf8000000u) == 0xc0000000u) {
 			const uint32_t op = (word >> 22) & 31, base = ((word >> 9) & 63) * 2,
@@ -350,7 +480,13 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			inst.family             = Family::VOP3;
 			inst.opcode_id          = (word >> 17) & 511;
 			inst.src_count          = 2;
-			switch (inst.opcode_id) {
+			const bool compare = inst.opcode_id < 256;
+			if (compare) {
+				if (!DecodeCompareOpcode(inst.opcode_id, inst) ||
+				    !ScalarPair(word & 255, inst.dst) || (word & 0x800) || ((operands >> 27) & 3))
+					return fail(pc, "invalid VOP3 compare opcode, mask destination or result modifiers");
+				effect.vcc_write = inst.dst.kind == OperandKind::VccLo;
+			} else switch (inst.opcode_id) {
 				case 259: inst.opcode = Opcode::V_ADD_F32; break;
 				case 260: inst.opcode = Opcode::V_SUB_F32; break;
 				case 261: inst.opcode = Opcode::V_SUBREV_F32; break;
@@ -367,9 +503,11 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 					break;
 				default: return fail(pc, "unsupported GCN VOP3 opcode");
 			}
-			inst.dst       = Vector(word & 255);
-			inst.dst.clamp = (word & 0x800) != 0;
-			inst.dst.omod  = (operands >> 27) & 3;
+			if (!compare) {
+				inst.dst       = Vector(word & 255);
+				inst.dst.clamp = (word & 0x800) != 0;
+				inst.dst.omod  = (operands >> 27) & 3;
+			}
 			Operand*                sources[] {&inst.src0, &inst.src1, &inst.src2};
 			std::optional<uint32_t> scalar;
 			for (uint32_t n = 0; n < 3; ++n) {
@@ -381,44 +519,66 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 					continue;
 				}
 				// GCN VOP3 has no RDNA literal extension. Enforce its single SGPR bus source.
-				if (bits == 255 || !source(bits, *sources[n]))
+				const bool mask_source = compare && CompareSpecialSource(bits, *sources[n]);
+				if (bits == 255 || (!mask_source && !source(bits, *sources[n])))
 					return fail(pc, "invalid GCN VOP3 source");
-				if (sources[n]->kind == OperandKind::Sgpr) {
+				if (mask_source || sources[n]->kind == OperandKind::Sgpr) {
 					if (scalar && *scalar != bits)
 						return fail(pc, "VOP3 has multiple SGPR bus sources");
 					scalar = bits;
+				}
+				if (compare && (absolute || negate)) {
+					const uint32_t op = inst.opcode_id & ~16u;
+					const bool floating = op < 64 || (op >= 200 && op <= 207);
+					if (!floating) return fail(pc, "invalid VOP3 compare source modifier");
 				}
 				sources[n]->absolute = absolute;
 				sources[n]->negate   = negate;
 			}
 		} else if ((word & 0xfe000000u) == 0x7c000000u) {
 			const uint32_t op = (word >> 17) & 255;
-			constexpr Opcode compares[] {Opcode::V_CMP_F_F32, Opcode::V_CMP_LT_F32,
-			    Opcode::V_CMP_EQ_F32, Opcode::V_CMP_LE_F32, Opcode::V_CMP_GT_F32,
-			    Opcode::V_CMP_LG_F32, Opcode::V_CMP_GE_F32, Opcode::V_CMP_O_F32,
-			    Opcode::V_CMP_U_F32, Opcode::V_CMP_NGE_F32, Opcode::V_CMP_NLG_F32,
-			    Opcode::V_CMP_NGT_F32, Opcode::V_CMP_NLE_F32, Opcode::V_CMP_NEQ_F32,
-			    Opcode::V_CMP_NLT_F32, Opcode::V_CMP_TRU_F32};
-			constexpr Opcode signed_compares[] {Opcode::V_CMP_F_I32, Opcode::V_CMP_LT_I32,
-			    Opcode::V_CMP_EQ_I32, Opcode::V_CMP_LE_I32, Opcode::V_CMP_GT_I32,
-			    Opcode::V_CMP_NE_I32, Opcode::V_CMP_GE_I32, Opcode::V_CMP_T_I32};
-			constexpr Opcode unsigned_compares[] {Opcode::V_CMP_F_U32, Opcode::V_CMP_LT_U32,
-			    Opcode::V_CMP_EQ_U32, Opcode::V_CMP_LE_U32, Opcode::V_CMP_GT_U32,
-			    Opcode::V_CMP_NE_U32, Opcode::V_CMP_GE_U32, Opcode::V_CMP_T_U32};
-			const bool cmpx = (op & 16) != 0;
-			const uint32_t base_op = op & ~16u;
-			if (!source(word & 511, inst.src0)) return fail(pc, "invalid VOPC source");
-			if (base_op < 16) inst.opcode = compares[base_op];
-			else if (base_op >= 128 && base_op < 136) inst.opcode = signed_compares[base_op - 128];
-			else if (base_op >= 192 && base_op < 200) inst.opcode = unsigned_compares[base_op - 192];
-			else return fail(pc, "unsupported VOPC type/predicate");
-			inst.family = Family::VOPC;
-			inst.gcn_cmpx_updates_vcc_exec = cmpx;
-			inst.opcode_id = op;
+			if (!DecodeCompareOpcode(op, inst))
+				return fail(pc, "unsupported VOPC type/predicate");
+			const uint32_t src0 = word & 511, src1 = (word >> 9) & 255;
 			inst.dst.kind = OperandKind::VccLo;
-			inst.src1 = Vector((word >> 9) & 255);
-			inst.src_count = 2;
-			effect.vcc_write = true;
+			if (src0 == 249) {
+				if (next == code.size()) return fail(pc, "truncated GCN VOPC SDWA");
+				if (CompareSourcePair(inst, 0) || CompareSourcePair(inst, 1))
+					return fail(pc, "SDWA compare does not accept 64-bit operands");
+				const uint32_t ext = code[next++];
+				if (ext & 0x40400000u) return fail(pc, "reserved VOPC SDWA modifier");
+				if ((ext & 0x8000u) && !ScalarPair((ext >> 8) & 127, inst.dst))
+					return fail(pc, "invalid VOPC SDWA destination pair");
+				if (!(ext & 0x8000u) && (ext & 0x7f00u))
+					return fail(pc, "reserved implicit VOPC SDWA destination");
+				const auto decode_sdwa = [&](uint32_t bits, uint32_t fields, Operand& operand) {
+					if (fields & 128) {
+						if (bits == 255 ||
+						    (!CompareSpecialSource(bits, operand) && !source(bits, operand)))
+							return false;
+					} else {
+						operand = Vector(bits);
+					}
+					operand.sdwa_sel = fields & 7;
+					operand.sdwa_sext = (fields & 8) != 0;
+					operand.negate = (fields & 16) != 0;
+					operand.absolute = (fields & 32) != 0;
+					return operand.sdwa_sel <= 6;
+				};
+				if (!decode_sdwa(ext & 255, ext >> 16, inst.src0) ||
+				    !decode_sdwa(src1, ext >> 24, inst.src1))
+					return fail(pc, "invalid VOPC SDWA source");
+				if ((ext & 0x80800000u) == 0x80800000u && (ext & 255) != src1)
+					return fail(pc, "SDWA compare has multiple scalar bus sources");
+				const bool floating = op < 32 || inst.data_bits == 16;
+				if (!floating && (ext & 0x30300000u))
+					return fail(pc, "floating-point modifier on integer SDWA compare");
+			} else {
+				if (!CompareSpecialSource(src0, inst.src0) && !source(src0, inst.src0))
+					return fail(pc, "invalid VOPC source");
+				inst.src1 = Vector(src1);
+			}
+			effect.vcc_write = inst.dst.kind == OperandKind::VccLo;
 		} else if ((word & 0xfc000000u) == 0xc8000000u) {
 			const uint32_t op = (word >> 16) & 3, attr = (word >> 10) & 63, chan = (word >> 8) & 3,
 			               dst = (word >> 18) & 255, src = word & 255;
@@ -530,6 +690,9 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			if (!source(word & 511, inst.src0))
 				return fail(pc, "invalid or truncated vector source");
 		}
+		if ((CompareSourcePair(inst, 0) && !IsValidComparePair(inst.src0)) ||
+		    (CompareSourcePair(inst, 1) && !IsValidComparePair(inst.src1)))
+			return fail(pc, "invalid 64-bit compare source");
 		inst.word_count = uint32_t(next - pc);
 		for (size_t i = pc; i < next; ++i)
 			inst.raw[i - pc] = code[i];
@@ -538,13 +701,16 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 		effects.push_back(effect);
 		pc = next;
 	}
-	// Definite-assignment intersection over the forward CFG, not lexical order.
-	constexpr size_t Scc = 360, Vcc = 361;
+	// Definite-assignment intersection over all incoming CFG edges.
+	constexpr size_t Scc = 360, Vcc = 361, VccHi = 362;
 	struct Flow {
-		std::bitset<362> defined;
+		std::bitset<363> defined;
+		std::array<std::bitset<104>, 2> entry_exec_words; // Entry EXEC_LO/HI provenance by SGPR.
 		std::vector<uint32_t> masks;
+		uint32_t dirty_exec = 0; // One bit for each directly modified EXEC half.
 		bool             may_export = false, must_export = false;
 		uint32_t         may_parameters = 0, must_parameters = 0;
+		bool operator==(const Flow&) const = default;
 	};
 	std::vector<std::optional<Flow>> incoming(program.instructions.size());
 	incoming[0] = Flow {};
@@ -554,24 +720,41 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 		incoming[0]->defined[0] = true;
 		incoming[0]->defined[1] = true;
 	}
-	bool       exit  = false;
+	bool exit = false;
+	std::deque<size_t> work {0};
+	std::vector<bool> queued(program.instructions.size());
+	queued[0] = true;
 	const auto merge = [&](size_t to, const Flow& flow) {
-		if (!incoming[to])
-			incoming[to] = flow;
-		else {
-			if (incoming[to]->masks != flow.masks) return false;
-			incoming[to]->defined &= flow.defined;
-			incoming[to]->may_export |= flow.may_export;
-			incoming[to]->must_export &= flow.must_export;
-			incoming[to]->may_parameters |= flow.may_parameters;
-			incoming[to]->must_parameters &= flow.must_parameters;
+		auto& state = incoming[to];
+		if (state) {
+			if (state->masks != flow.masks) return false;
+			Flow joined = *state;
+			joined.defined &= flow.defined;
+			for (uint32_t half = 0; half < 2; ++half)
+				joined.entry_exec_words[half] &= flow.entry_exec_words[half];
+			joined.dirty_exec |= flow.dirty_exec;
+			joined.may_export |= flow.may_export;
+			joined.must_export &= flow.must_export;
+			joined.may_parameters |= flow.may_parameters;
+			joined.must_parameters &= flow.must_parameters;
+			if (joined == *state) return true;
+			state = std::move(joined);
+		} else {
+			state = flow;
+		}
+		if (!queued[to]) {
+			work.push_back(to);
+			queued[to] = true;
 		}
 		return true;
 	};
-	for (size_t i = 0; i < program.instructions.size(); ++i) {
+	while (!work.empty()) {
+		const size_t i = work.front();
+		work.pop_front();
+		queued[i] = false;
 		const auto& inst = program.instructions[i];
 		const bool  branch =
-		    inst.opcode == Opcode::S_BRANCH || ((effects[i].scc_read || effects[i].exec_read) && inst.family == Family::SOPP);
+		    inst.opcode == Opcode::S_BRANCH || ((effects[i].scc_read || effects[i].mask_branch) && inst.family == Family::SOPP);
 		size_t target = 0;
 		if (branch) {
 			auto it = boundaries.find(inst.branch_target);
@@ -581,31 +764,57 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			if (program.instructions[target].opcode == Opcode::V_INTERP_P2_F32)
 				return fail(inst.pc / 4, "branch into interpolation pair");
 		}
-		if (!incoming[i]) return fail(inst.pc / 4, "unreachable instruction/trailing code");
 		auto          flow = *incoming[i];
-		if (branch && !flow.masks.empty() && !effects[i].exec_read)
-			return fail(inst.pc / 4, "only a canonical EXECZ guard may branch inside a mask region");
-		if (effects[i].exec_read) {
-			if (flow.masks.empty() ||
-			    (!effects[target].mask_restore && !effects[target].mask_else) ||
-			    program.instructions[target].src0.reg != (flow.masks.back() & 127))
-				return fail(inst.pc / 4, "EXECZ guard must skip to this frame's else or restore");
+		if (branch && !flow.masks.empty() && !effects[i].mask_branch && !effects[i].scc_read)
+			return fail(inst.pc / 4, "unconditional branch inside an EXEC frame");
+		const auto& effect = effects[i];
+		const auto has_entry_pair = [&](uint32_t reg) {
+			return flow.entry_exec_words[0][reg] && flow.entry_exec_words[1][reg + 1];
+		};
+		if (effect.mask_else) {
+			if (!flow.masks.empty()) {
+				if (flow.masks.back() != inst.src0.reg)
+					return fail(inst.pc / 4, "else requires the unchanged top saved pair exactly once");
+				flow.masks.back() |= 256; // Frame phase, not a physical SGPR bit.
+			} else if (!has_entry_pair(inst.src0.reg)) {
+				return fail(inst.pc / 4, "else requires an unchanged saved EXEC pair");
+			}
 		}
-		if (effects[i].mask_else) {
-			if (flow.masks.empty() || flow.masks.back() != inst.src0.reg)
-				return fail(inst.pc / 4, "else requires the unchanged top saved pair exactly once");
-			flow.masks.back() |= 256; // Frame phase, not a physical SGPR bit.
-		}
-		if (inst.gcn_cmpx_updates_vcc_exec && flow.masks.empty())
-			return fail(inst.pc / 4, "CMPX requires a saved EXEC frame in this profile");
-		if (effects[i].vcc_read && !flow.defined[Vcc]) return fail(inst.pc / 4, "undefined VCC");
-		if (effects[i].mask_restore) {
-			if (flow.masks.empty() || (flow.masks.back() & 127) != inst.src0.reg)
-				return fail(inst.pc / 4, "EXEC restore does not match innermost saved pair");
-			flow.masks.pop_back();
+		if (effect.vcc_read && (!flow.defined[Vcc] || !flow.defined[VccHi]))
+			return fail(inst.pc / 4, "undefined VCC");
+		const bool writes_exec = inst.gcn_cmpx_updates_vcc_exec ||
+		    inst.dst.kind == OperandKind::ExecLo || inst.dst.kind == OperandKind::ExecHi;
+		if (effect.mask_restore) {
+			if (!flow.masks.empty()) {
+				if ((flow.masks.back() & 127) != inst.src0.reg)
+					return fail(inst.pc / 4, "EXEC restore does not match innermost saved pair");
+				flow.masks.pop_back();
+			} else {
+				if (!has_entry_pair(inst.src0.reg))
+					return fail(inst.pc / 4, "EXEC restore has no proven entry mask");
+				flow.dirty_exec = 0;
+			}
+		} else if (writes_exec && flow.masks.empty()) {
+			const bool writes_pair = inst.family == Family::VOPC || inst.data_dwords == 2;
+			const uint32_t halves = writes_pair ? 3u : inst.dst.kind == OperandKind::ExecHi ? 2u : 1u;
+			for (uint32_t half = 0; half < 2; ++half) {
+				const uint32_t bit = 1u << half;
+				if (!(halves & bit)) continue;
+				const auto& saved = flow.entry_exec_words[half];
+				const auto exec_half = half ? OperandKind::ExecHi : OperandKind::ExecLo;
+				if (inst.opcode == Opcode::S_MOV_B32 &&
+				    ((inst.src0.kind == OperandKind::Sgpr && saved[inst.src0.reg]) ||
+				     (inst.src0.kind == exec_half && !(flow.dirty_exec & bit)))) {
+					flow.dirty_exec &= ~bit;
+				} else {
+					if (saved.none())
+						return fail(inst.pc / 4, "EXEC write requires a saved entry half");
+					flow.dirty_exec |= bit;
+				}
+			}
 		}
 		if (inst.dst.kind == OperandKind::Sgpr) {
-			const uint32_t count = inst.family == Family::SMEM || effects[i].mask_save ? inst.data_dwords : 1;
+			const uint32_t count = inst.family == Family::VOPC ? 2 : inst.data_dwords;
 			for (uint32_t saved: flow.masks) {
 				saved &= 127;
 				if (inst.dst.reg < saved + 2 && saved < inst.dst.reg + count)
@@ -616,15 +825,33 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			if (flow.masks.size() == 8) return fail(inst.pc / 4, "EXEC nesting budget exceeded");
 			flow.masks.push_back(inst.dst.reg);
 		}
-		if ((inst.opcode == Opcode::EXP || inst.opcode == Opcode::S_ENDPGM) && !flow.masks.empty())
+		if ((inst.opcode == Opcode::EXP || inst.opcode == Opcode::S_ENDPGM) &&
+		    (!flow.masks.empty() || flow.dirty_exec))
 			return fail(inst.pc / 4, "export/end requires restored EXEC");
 		const Operand sources[] {inst.src0, inst.src1, inst.src2, inst.src3};
 		for (uint32_t n = 0; n < inst.src_count; ++n) {
 			const auto&  source = sources[n];
+			if (source.kind == OperandKind::Scc && !flow.defined[Scc])
+				return fail(inst.pc / 4, "read of undefined SCC");
+			if (source.kind == OperandKind::VccZ && (!flow.defined[Vcc] || !flow.defined[VccHi]))
+				return fail(inst.pc / 4, "VCCZ requires both halves of VCC");
 			const size_t reg    = source.kind == OperandKind::Sgpr ? source.reg + 256 : source.reg;
+			if ((source.kind == OperandKind::VccLo && !flow.defined[Vcc]) ||
+			    (source.kind == OperandKind::VccHi && !flow.defined[VccHi]))
+				return fail(inst.pc / 4, "read of undefined VCC half");
 			if ((source.kind == OperandKind::Vgpr || source.kind == OperandKind::Sgpr) &&
 			    !flow.defined[reg])
 				return fail(inst.pc / 4, "read of undefined register on a control-flow path");
+			const bool pair_read =
+			    (inst.data_dwords == 2 &&
+			     (inst.family == Family::SOP2 || inst.opcode == Opcode::S_MOV_B64)) ||
+			    CompareSourcePair(inst, n);
+			if (pair_read && source.kind == OperandKind::VccLo && !flow.defined[VccHi])
+				return fail(inst.pc / 4, "read of undefined upper VCC in 64-bit operand");
+			if (pair_read && (source.kind == OperandKind::Sgpr || source.kind == OperandKind::Vgpr) &&
+			    !flow.defined[reg + 1])
+				return fail(inst.pc / 4, source.kind == OperandKind::Sgpr ?
+				    "read of undefined upper SGPR in B64 operand" : "read of undefined upper VGPR in B64 operand");
 		}
 		if (inst.family == Family::SMEM || inst.family == Family::MUBUF || inst.family == Family::MTBUF ||
 		    inst.family == Family::MIMG) {
@@ -658,18 +885,38 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 				     ++n) {
 					if (stage == Stage::Pixel && parameter_count && inst.dst.reg + n < 2)
 						return fail(inst.pc / 4, "MUBUF overwrites interpolation coordinates");
-					if (!flow.masks.empty() && !flow.defined[inst.dst.reg + n])
+					if ((!flow.masks.empty() || flow.dirty_exec) && !flow.defined[inst.dst.reg + n])
 						return fail(inst.pc / 4, "masked VGPR write lacks inactive-lane value");
 					flow.defined[inst.dst.reg + n] = true;
 				}
 		}
 		if (inst.dst.kind == OperandKind::Sgpr) {
-			const uint32_t count = inst.family == Family::SMEM || effects[i].mask_save ? inst.data_dwords : 1;
-			for (uint32_t n = 0; n < count; ++n)
+			const uint32_t count = inst.family == Family::VOPC ? 2 : inst.data_dwords;
+			std::array<std::bitset<104>, 2> copied;
+			for (uint32_t half = 0; half < 2; ++half) {
+				const auto exec_half = half ? OperandKind::ExecHi : OperandKind::ExecLo;
+				const bool entry_half = flow.masks.empty() && !(flow.dirty_exec & (1u << half));
+				if (inst.opcode == Opcode::S_MOV_B64 && inst.src0.kind == OperandKind::ExecLo && entry_half)
+					copied[half].set(inst.dst.reg + half);
+				if (inst.opcode == Opcode::S_MOV_B32 && inst.src0.kind == exec_half && entry_half)
+					copied[half].set(inst.dst.reg);
+				if ((inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOV_B64) &&
+				    inst.src0.kind == OperandKind::Sgpr) {
+					for (uint32_t n = 0; n < count; ++n)
+						if (flow.entry_exec_words[half][inst.src0.reg + n])
+							copied[half].set(inst.dst.reg + n);
+				}
+			}
+			for (uint32_t n = 0; n < count; ++n) {
 				flow.defined[256 + inst.dst.reg + n] = true;
+				for (auto& saved : flow.entry_exec_words) saved.reset(inst.dst.reg + n);
+			}
+			for (uint32_t half = 0; half < 2; ++half)
+				flow.entry_exec_words[half] |= copied[half];
 		}
 		if (effects[i].scc_write) flow.defined[Scc] = true;
-		if (effects[i].vcc_write) flow.defined[Vcc] = true;
+		if (effects[i].vcc_write || inst.dst.kind == OperandKind::VccLo) flow.defined[Vcc] = true;
+		if (effects[i].vcc_write || inst.dst.kind == OperandKind::VccHi) flow.defined[VccHi] = true;
 		if (inst.opcode == Opcode::EXP) {
 			if (inst.exp.target >= 32) {
 				const uint32_t bit = 1u << (inst.exp.target - 32);
@@ -698,6 +945,8 @@ bool Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& outpu
 			if (!merge(i + 1, flow)) return fail(inst.pc / 4, "inconsistent EXEC stack at flow merge");
 		}
 	}
+	for (size_t i = 0; i < incoming.size(); ++i)
+		if (!incoming[i]) return fail(program.instructions[i].pc / 4, "unreachable instruction/trailing code");
 	if (!exit) return fail(code.size(), "missing reachable s_endpgm");
 	output = std::move(program);
 	return true;
@@ -979,12 +1228,21 @@ std::vector<uint32_t> CmpxPixelFixture(uint32_t kind) {
 	// Correct false blue is .5, chosen independently of the red branch.
 	if (kind >= 3) IntegerCompareInputs(code);
 	else code.push_back(Vop1(1, 11, 240));
-	const uint32_t op = kind == 1 ? 16 : kind == 2 ? 31 : kind == 3 ? 145 : kind == 4 ? 209 : 17;
+	const uint32_t op = kind == 1 ? 16 : kind == 2 ? 31 : kind == 3 ? 177 : kind == 4 ? 241 : 17;
 	const uint32_t compare = 0x7c000000u | (op << 17) | ((kind >= 3 ? 12u : 11u) << 9) |
-	                         (kind >= 3 ? 267u : 259u);
+	                         (kind >= 3 ? 266u : 259u);
 	code.insert(code.end(), {0x7c000000u | (1u << 17) | (10u << 9) | 258u, // outer red < .75
 	    Vop1(1, 2, 255), std::bit_cast<uint32_t>(.125f), // initialize lanes outside outer mask
-	    0xbe90246au, compare, 0xbf880002u, Vop1(1, 2, 255), std::bit_cast<uint32_t>(.75f),
+	});
+	if (kind >= 3)
+		code.insert(code.end(), {Vop1(1, 10, 128), Vop1(1, 13, 268), Vop1(1, 12, 128)});
+	code.insert(code.end(), {0xbe90246au, compare,
+	    0xbe94046au, 0xbeea0414u, // VCC -> s[20:21] -> VCC
+	    0xbeea036au, 0xbeeb036bu, // VCC_LO/VCC_HI through MOV_B32
+	    0xbefe037eu, 0xbeff037fu, // EXEC_LO/EXEC_HI through MOV_B32
+	    0xbf880006u, 0xbe940382u, // Skip loop when EXEC is empty. s20 = 2.
+	    Vop2(3, 2, 255, 2), std::bit_cast<uint32_t>(.3125f),
+	    0x80948114u, 0xbf078014u, 0xbf85fffbu, // --s20; branch while nonzero
 	    0x89fe7e10u, 0xbf880002u, Vop1(1, 2, 255), std::bit_cast<uint32_t>(.125f), 0xbefe0410u,
 	    Vop2(0, 4, 271, 14), // VCC must also hold the CMPX result after restoring EXEC
 	    0xf800180fu, 0x05040302u, 0xbf810000u});

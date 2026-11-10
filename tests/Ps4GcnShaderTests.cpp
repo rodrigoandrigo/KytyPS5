@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
 	ShaderRecompiler::Decoder::Program flow;
 	Check(Gcn::Decode(normalized, Gcn::Stage::Pixel, flow, error), error);
 	const auto flow_count = flow.instructions.size();
-	for (uint32_t branch: {0xbf850001u, 0xbf85ffffu, 0xbf857fffu}) {
+	for (uint32_t branch: {0xbf850001u, 0xbf858000u, 0xbf857fffu}) {
 		auto bad = normalized;
 		bad[4]   = branch;
 		Check(!Gcn::Decode(bad, Gcn::Stage::Pixel, flow, error) &&
@@ -460,15 +460,118 @@ int main(int argc, char** argv) {
 		}
 		reject_else(bad); // second complement in the same frame
 		bad = Gcn::ElsePixelFixture();
-		for (auto& word: bad) if ((word & 0xffff0000u) == 0xbf880000u) { word = 0xbf880000u; break; }
-		reject_else(bad); // guard targets a VALU instead of transition/restore
+		for (auto& word: bad) if ((word & 0xffff0000u) == 0xbf880000u) { word = 0xbf880001u; break; }
+		reject_else(bad); // guard targets the literal of a VALU instruction
 		bad = Gcn::ElsePixelFixture(false, true);
 		for (auto& word: bad) if (word == 0x89fe7e12u) word = 0x89fe7e10u;
 		reject_else(bad); // nested else uses parent frame
 	}
 	{
 		for (uint32_t mode = 0; mode < 7; ++mode) {
-			const auto code = mode < 2 ? Gcn::IntegerComparePixelFixture(mode == 1) : Gcn::CmpxPixelFixture(mode - 2);
+			auto code = mode < 2 ? Gcn::IntegerComparePixelFixture(mode == 1) : Gcn::CmpxPixelFixture(mode - 2);
+			if (mode == 2) {
+				const auto save = std::find(code.begin(), code.end(), 0xbe94046au);
+				Check(save != code.end() && save != code.begin(), "CMPX explicit destination fixture");
+				// Replace CMPX VCC and its following VCC->s20 copy with CMPX s[20:21].
+				const uint32_t encoded_cmpx = *(save - 1);
+				*(save - 1) = 0xd0000014u | (encoded_cmpx & (255u << 17));
+				*save = (encoded_cmpx & 0x1ffffu) | (1u << 17);
+				// Keep blue only if every predicate agrees with the CPU oracle.
+				// These cases run in the existing D3D12/WARP/Vulkan pixel readback.
+				std::vector<uint32_t> checks {0x7e1a0280u}; // v13 = 0
+				const auto load = [&](uint32_t reg, uint32_t value) {
+					checks.insert(checks.end(), {0x7e0002ffu | (reg << 17), value});
+				};
+				const auto compare = [&](uint32_t op, uint32_t rhs, bool expected) {
+					checks.push_back(0x7c00010au | (op << 17) | (rhs << 9));
+					checks.push_back((4u << 17) | ((expected ? 4u : 13u) << 9) |
+					                 (expected ? 269u : 260u)); // v_cndmask_b32 v4
+				};
+				const uint64_t values[] {
+				    0x7ff0000000000001ull, 0x7ff8000000000000ull, 0xfff0000000000000ull,
+				    0xbff0000000000000ull, 0x8000000000000001ull, 0x8000000000000000ull,
+				    0x0000000000000000ull, 0x0000000000000001ull, 0x3ff0000000000000ull,
+				    0x7ff0000000000000ull};
+				for (uint32_t bit = 0; bit < std::size(values); ++bit) {
+					load(10, uint32_t(values[bit]));
+					load(11, uint32_t(values[bit] >> 32));
+					load(12, 1u << bit);
+					compare(168, 12, true);
+					load(12, 0x3ffu ^ (1u << bit));
+					compare(168, 12, false);
+				}
+				load(10, 0x8000);
+				load(12, 0);
+				compare(202, 12, true); // -0 == +0
+				load(10, 0x0001);
+				compare(204, 12, true); // smallest positive subnormal > +0
+				load(10, 0x7e00);
+				compare(207, 12, false); // NaN is unordered
+				load(10, 0xbf800000u); // -1.0
+				checks.push_back(0x7c00190au); // V_CMP_F_F32 -> VCC = 0
+				checks.insert(checks.end(), {
+				    0xd0080114u, 0x0002190au, // V_CMP_GT_F32 s[20:21], abs(v10), v12
+				    0x00081b04u, // Keep blue when VCC is still false.
+				    0xbeea0414u, // Copy explicit compare result to VCC.
+				    0x0008090du, // Keep blue when the explicit compare is true.
+				});
+				load(12, 0);
+				load(13, 0x3ff40000);
+				// The keep-blue predicate needs a dedicated zero VGPR now that v13
+				// contains the high word of the right operand.
+				load(15, 0);
+				const auto check_literal = [&](uint32_t opcode, uint32_t literal) {
+					checks.insert(checks.end(), {0x7c0018ffu | (opcode << 17), literal, 0x0008090fu});
+				};
+				check_literal(34, 0x3ff40000); // F64 literal supplies the high DWORD.
+				load(12, 0x87654321);
+				load(13, 0xffffffff);
+				check_literal(162, 0x87654321); // I64 sign extension.
+				load(13, 0);
+				check_literal(226, 0x87654321); // U64 zero extension.
+				load(12, 512);
+				check_literal(168, 0x7ff00000); // F64 class reads the literal as +infinity.
+				load(12, 0);
+				load(13, 0x3ff00000);
+				checks.insert(checks.end(), {0x7c4418f2u, 0x0008090fu}); // F64 inline 1.0.
+				load(12, 0xffffffff);
+				load(13, 0xffffffff);
+				checks.insert(checks.end(), {0x7d4418c1u, 0x0008090fu}); // I64 inline -1.
+				for (uint32_t mask_pair : {106u, 126u}) {
+					// Compare a mask pair with itself via the VOP3 scalar bus.
+					checks.insert(checks.end(), {0xd0000014u | (226u << 17),
+					    mask_pair | (mask_pair << 9), 0xbeea0414u, 0x0008090fu});
+				}
+				const auto check_special = [&](uint32_t source, uint32_t expected) {
+					load(12, expected);
+					checks.insert(checks.end(), {0x7d841800u | source, 0x0008090fu});
+				};
+				check_special(252, 0); // EXECZ while the entry mask is restored.
+				check_special(251, 0); // The previous compare left VCC nonzero.
+				checks.push_back(0x7c00190au); // V_CMP_F_F32 clears VCC.
+				check_special(251, 1);
+				checks.push_back(0xbf068080u); // S_CMP_EQ_U32 0, 0 sets SCC.
+				check_special(253, 1);
+				checks.push_back(0xbf068180u); // S_CMP_EQ_U32 0, 1 clears SCC.
+				check_special(253, 0);
+				load(10, 0x00ff0000u);
+				load(12, 0xffffffffu);
+				// I32 EQ, sign-extended byte 2 versus the complete DWORD.
+				checks.insert(checks.end(), {0x7d0418f9u, 0x060a940au,
+				                            0xbeea0414u, 0x0008090fu});
+				load(10, 0xabcd0000u);
+				load(12, 0x0000abcdu);
+				// U32 EQ, high word of v10 versus low word of v12.
+				checks.insert(checks.end(), {0x7d8418f9u, 0x0405000au, 0x0008090fu});
+				code.insert(code.end() - 3, checks.begin(), checks.end());
+			}
+			if (mode == 4) {
+				const auto save = std::find(code.begin(), code.end(), 0xbe94046au);
+				Check(save != code.end() && save != code.begin(), "CMPX SDWA fixture");
+				const uint32_t raw = *(save - 1);
+				*(save - 1) = (raw & ~511u) | 249u;
+				*save = 0x06069400u | (raw & 255); // DWORD selects and explicit s[20:21].
+			}
 			std::vector<uint32_t> words;
 			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
 			Check(validator.Validate(words), "integer VOPC/CMPX SPIR-V validation");
@@ -486,6 +589,16 @@ int main(int argc, char** argv) {
 				Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
 				Check(validator.Validate(words), "integer predicate family SPIR-V validation");
 			}
+		for (uint32_t source : {251u, 253u}) {
+			auto code = Gcn::IntegerComparePixelFixture();
+			for (auto& word : code)
+				if ((word & 0xfe000000u) == 0x7c000000u)
+					word = (word & ~511u) | source;
+			std::vector<uint32_t> words;
+			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find(source == 251 ? "VCCZ requires" : "undefined SCC") != std::string::npos,
+			      "undefined compare condition source");
+		}
 		// CMPX outside a saved frame would leave no proven restoration path.
 		auto bad = Gcn::IntegerComparePixelFixture();
 		for (auto& word: bad) if ((word & 0xfe000000u) == 0x7c000000u) word |= 16u << 17;
@@ -501,6 +614,130 @@ int main(int argc, char** argv) {
 		for (const auto& inst: program.instructions) marked += inst.gcn_cmpx_updates_vcc_exec;
 		Check(marked == 1 && !ShaderRecompiler::Decoder::Instruction{}.gcn_cmpx_updates_vcc_exec,
 		      "GCN CMPX marker/default semantics");
+	}
+	{
+		// A forward mask branch may skip a VALU while staying in the same EXEC frame.
+		for (uint32_t opcode : {6u, 7u, 8u, 9u}) {
+			auto code = Gcn::ElsePixelFixture();
+			for (auto& word : code) {
+				if (word == 0xbf880002u) {
+					word = 0xbf800002u | (opcode << 16);
+					break;
+				}
+			}
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "forward VCC/EXEC branch SPIR-V");
+		}
+		auto undefined = Gcn::SolidPixelFixture();
+		undefined.insert(undefined.begin(), 0xbf860000u);
+		std::vector<uint32_t> words {123};
+		Check(!Gcn::Compile(undefined, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined VCC") != std::string::npos &&
+		          words == std::vector<uint32_t> {123}, "branch with undefined VCC");
+	}
+	for (uint32_t opcode : {15u, 17u, 19u, 21u, 23u}) {
+		auto code = Gcn::SolidPixelFixture();
+		const uint32_t binary = 0x80000000u | (opcode << 23) | (20u << 16) | (18u << 8) | 16u;
+		code.insert(code.begin(), {0xbe900380u, 0xbe910381u, 0xbe920381u, 0xbe930380u, binary});
+		code.insert(code.end() - 3, 0x7e000215u); // Consume the upper result word.
+		std::vector<uint32_t> words;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error), error);
+		Check(validator.Validate(words), "B64 SGPR pair SPIR-V");
+		code.erase(code.begin() + 1);
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined upper SGPR") != std::string::npos, "undefined B64 input");
+	}
+	{
+		auto code = Gcn::SolidPixelFixture();
+		// s0 = 3; do { s0 -= 1; } while (s0 != 0).
+		code.insert(code.begin(), {0xbe800383u, 0x80808100u, 0xbf078000u, 0xbf85fffdu});
+		std::vector<uint32_t> words;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error), error);
+		Check(validator.Validate(words), "GCN scalar loop SPIR-V");
+		// A backedge cannot make a value defined at the first loop entry.
+		code[0] = 0xbf800000u;
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined register") != std::string::npos, "loop entry definition");
+	}
+	{
+		for (uint32_t predicate = 0; predicate < 16; ++predicate) {
+			auto code = Gcn::CmpxPixelFixture(3);
+			for (auto& word : code)
+				if ((word & 0xfffe0000u) == (0x7c000000u | (177u << 17)))
+					word = (word & ~(255u << 17)) | ((48u + predicate) << 17);
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "F64 CMPX SPIR-V");
+		}
+		for (uint32_t opcode : {136u, 137u, 138u, 139u, 140u, 141u, 142u,
+		                        169u, 170u, 171u, 172u, 173u, 174u,
+		                        200u, 201u, 202u, 203u, 204u, 205u, 206u, 207u}) {
+			auto code = Gcn::IntegerComparePixelFixture();
+			for (auto& word : code)
+				if ((word & 0xfe000000u) == 0x7c000000u)
+					word = (word & ~(255u << 17)) | (opcode << 17);
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "VOPC 16-bit or F32 class SPIR-V");
+		}
+		{
+			auto code = Gcn::CmpxPixelFixture(3);
+			for (auto& word : code)
+				if ((word & 0xfffe0000u) == (0x7c000000u | (177u << 17)))
+					word = (word & ~(255u << 17)) | (184u << 17);
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "F64 class CMPX SPIR-V");
+		}
+		for (uint32_t exit = 0; exit < 2; ++exit) {
+			auto code = Gcn::MaskedPixelFixture(false, false);
+			const auto restore = std::find(code.begin(), code.end(), 0xbefe0410u);
+			Check(restore != code.end(), "multi-exit fixture restore");
+			code.erase(restore, code.end());
+			const auto save = std::find(code.begin(), code.end(), 0xbe90246au);
+			Check(save != code.end(), "multi-exit fixture save");
+			const auto save_index = save - code.begin();
+			*save = exit ? 0xbe90037eu : 0xbe90047eu; // Save EXEC_LO or the pair.
+			if (exit) code.insert(code.begin() + save_index + 1, 0xbe91037fu); // Save EXEC_HI.
+			code.insert(code.begin() + save_index + (exit ? 2 : 1), 0x87fe6a7eu); // AND EXEC, EXEC, VCC
+			// The preceding VALU write is divergent in both scenes. Select a
+			// known wave-uniform exit afterward so the oracle is independent of
+			// how the host groups pixels into waves.
+			const uint32_t mask = exit ? 128u : 193u; // zero or all ones
+			code.insert(code.end(), {0xbe920300u | mask, 0xbe930300u | mask});
+			if (exit) {
+				code.insert(code.end(), {0xbefe0312u, 0xbeff0313u}); // Clear both EXEC halves.
+			} else {
+				code.push_back(0x87fe1210u); // AND EXEC, s[16:17], s[18:19]
+			}
+			code.insert(code.end(), {0xbe940410u, exit ? 0xbf880007u : 0xbf880006u});
+			const auto append_exit = [&](float blue) {
+				if (exit) code.insert(code.end(), {0xbefe0314u, 0xbeff0315u});
+				else code.push_back(0xbefe0414u);
+				code.insert(code.end(), {0x7e0802ffu, std::bit_cast<uint32_t>(blue),
+				                         0xf800180fu, 0x05040302u, 0xbf810000u});
+			};
+			append_exit(.375f);
+			append_exit(.625f);
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "divergent two-exit SPIR-V");
+			std::ofstream file(folder / ("gcn-cfg-exit" + std::to_string(exit) + ".frag.spv"), std::ios::binary);
+			file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+			Check(bool(file), "write divergent two-exit fixture");
+			auto clobbered = code;
+			const auto copy = std::find(clobbered.begin(), clobbered.end(), 0xbe940410u);
+			Check(copy != clobbered.end(), "EXEC snapshot copy");
+			// Only one incoming edge clobbers the upper half.
+			clobbered.insert(copy, {0xbf840001u, 0xbe910380u});
+			const bool accepted = Gcn::Compile(clobbered, Gcn::Stage::Pixel, words, error, {}, 1);
+			Check(!accepted && error.find(exit ? "saved entry half" : "proven entry mask") != std::string::npos,
+			      "overwritten EXEC snapshot: " + error);
+			code[code.size() - 6] = 0xbf800000u;
+			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find("requires restored EXEC") != std::string::npos, "unrestored second exit");
+		}
 	}
 	// Indirect immutable table snapshots: only two user SGPRs, but two buffers,
 	// image and sampler in both stages. Prepared, not executed during integration.

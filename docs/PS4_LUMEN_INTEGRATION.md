@@ -110,3 +110,88 @@ Evidências em `build/lumen-validation`: `shaders.log` (saída0), `gnm-unit.log`
 A reconstrução dos dependentes foi executada nesta rodada. O Ninja perdeu registros e iniciou uma repetição após regeneração; a repetição foi interrompida. `commands.json` e `relink-current.py` registram comandos CMake atuais usados para recompilar o teste corrigido e ligar os objetos próprios recém-reconstruídos, sem mistura de objetos antigos de Instruction. O build inicial e as falhas estão preservados em `build-desktop.log`; compile/link têm logs separados. Isso é evidência de compilação e execução dos targets indicados, sem alegar que toda a aplicação desktop foi construída nesta rodada.
 
 Estes resultados substituem o estado não validado dos perfis acima, mas não fecham P0–P15. Não exercitam jogo comercial, lançamento normal PS4, apresentação integrada ou Xbox. A regressão PS5 é shader_cfg, não gameplay. Próximo incremento de ISA: comparações GCN de64bits com verificação de ambos os registradores de cada par, limites RSRC1 e resultados de lanes; depois fluxo/máscaras e layouts gerais. Build completo UWP/D3D12 aprovado via `src/uwp/uwp.ps1 build -BuildDir build/stage3-uwp` (uwp.log); auditoria explícita Test-Imports retornouTrue para4binários (uwp-imports.log). Sem instalação/deploy ou execução AppContainer/Xbox.
+
+
+## 2026-11-09 — Desvios VCC/EXEC e operações B64
+
+O decoder GCN aceita desvios para frente S_CBRANCH_VCCZ, VCCNZ, EXECZ e EXECNZ. O CFG compartilhado avalia a condição por subgrupo. O frontend exige VCC definido antes da leitura e valida o destino, a pilha de EXEC e a definição de registradores em todos os caminhos de entrada. VGPRs escritos sob EXEC reduzido ainda precisam de valor anterior para as lanes inativas.
+
+S_AND_B64, S_OR_B64, S_XOR_B64, S_ANDN2_B64 e S_ORN2_B64 aceitam pares alinhados de SGPRs. O decoder verifica ambas as palavras, o compilador protege as duas palavras de descritores imutáveis e o GNM verifica a alocação RSRC1. O tradutor compartilhado calcula SCC a partir do resultado de 64 bits. O XOR canônico para alternar entre then e else continua sujeito às regras do frame salvo.
+
+O objetivo de fluxo e máscaras gerais permanece incompleto. Escritas livres em EXEC/VCC, operandos especiais nas operações B64, loops e as famílias restantes de CMP/CMPX exigem implementação e validação próprias. O próximo passo é representar a proveniência das máscaras e as definições por lane nos pontos de junção e nas arestas de retorno.
+
+CTest aprovou 10/10 em 36,09 s, incluindo os casos novos de SPIR-V, as fixtures GNM no desktop/Vulkan e a regressão PS5 shader_cfg. Build UWP/D3D12 terminou com código 0. Os casos novos de desvios e B64 ainda aguardam readback próprio em D3D12/Vulkan. Logs em build/ps4-mask-branches/ctest.log e uwp.log. Incremento de frontend validado. Objetivo completo INCOMPLETO.
+
+
+## 2026-11-09 — Arestas de retorno no CFG GCN
+
+GcnDecoder.cpp agora aceita offsets de salto com sinal e valida definições de registradores, exports e pilha EXEC por fila de trabalho até convergir, incluindo arestas de retorno. O estado inicial participa da junção na entrada. Uma definição em iteração posterior não valida uma leitura da primeira iteração. A escrita mascarada continua exigindo valor prévio para as lanes inativas. GcnCompiler.cpp recusa saltos para o preâmbulo escalar especializado.
+
+Ps4GcnShaderTests.cpp valida SPIR-V para um laço escalar de três iterações e rejeita a variante que lê o contador sem inicialização. Os binários desktop foram recompilados e religados com os comandos do Ninja extraídos por build/ps4-gcn-loops-build.py. CTest aprovou 10/10 em 30,77 s, incluindo GNM/Vulkan e shader_cfg PS5. O build UWP/D3D12 terminou com código zero via src/uwp/uwp.ps1 build -BuildDir build/stage3-uwp. Logs em build/ps4-gcn-loops. O laço novo foi validado em SPIR-V. Readback dedicado e execução em Xbox continuam pendentes.
+
+O objetivo completo permanece INCOMPLETO. Próxima ação: testar laços com EXEC variável e preservação de VGPR por readback, depois modelar a proveniência de escritas livres em EXEC/VCC e ampliar CMP/CMPX a partir dos opcodes Gen4. O teste atual comprova o laço escalar, com cobertura pendente para CFG irreducível e divergência com múltiplas saídas.
+
+
+## 2026-11-09 — VOPC I64/U64 e laço sob EXEC reduzido
+
+GcnDecoder.cpp adiciona os oito predicados VOPC de I64 e U64 e as variantes CMPX. A codificação foi conferida no Gen4 local e a tradução usa as operações de comparação existentes da IR. As duas palavras dos operandos precisam estar definidas e caber na alocação RSRC1. S_MOV_B64 copia pares SGPR/VCC e lê EXEC completo. O destino EXEC continua restrito ao par do frame salvo. Branches SCC podem fechar laços dentro do frame com a mesma pilha nos pontos de junção.
+
+A fixture CMPX faz a cópia VCC → SGPR → VCC, executa duas somas sob EXEC reduzido, reconverge e verifica tanto a cor acumulada das lanes ativas quanto a cor preservada das demais. As variantes 87 e 88 cobrem CMPX I64 e U64. CTest passou 10/10 em 25,20 s, incluindo shader_cfg PS5. O script tests/run-ps4-gcn-gpu.ps1 passou em D3D12 hardware, WARP e Vulkan com 2048 pixels por cena e zero erros reportados pelas camadas. O build UWP/D3D12 passou. Logs de compilação, CTest, UWP, SPIR-V e GPU em build/ps4-gcn-divergence. A execução foi no desktop.
+
+Objetivo completo INCOMPLETO. Permanecem pendentes escritas gerais de EXEC, operações sobre metades de EXEC/VCC, tipos e formatos restantes de CMP/CMPX e CFG divergente com múltiplas saídas. A próxima extensão é modelar a proveniência de máscaras salvas fora do padrão AND_SAVEEXEC e testar restauração em junções com múltiplas saídas.
+
+
+Em 2026-11-09, o frontend GCN passou a aceitar MOV, NOT e ALU escalar sobre as metades de EXEC/VCC, além de operações lógicas B64 com pares de máscara. A análise distingue as duas metades de VCC e exige frame salvo para alterar EXEC. Foram adicionados VOPC F64 CMP/CMPX, I16/U16 e CLASS_F32, além de testes de CFG com duas saídas restauradas e rejeição de saída sem restauração. As quatro metades passaram por readback D3D12, WARP e Vulkan na rodada ps4-gcn-mask-halves. O teste de F64 e o CFG de duas saídas passaram em SPIR-V. A rodada ps4-gcn-narrow-compare passou em CTest e build UWP/D3D12. Logs nos respectivos diretórios build.
+
+Meta ativa e incompleta. Próxima ação: implementar VOPC F16 e CLASS_F64 com checagem de NaN, zero e denormais. Depois cobrir os formatos VOP3 e sinalizantes, escritas de EXEC fora do padrão de frame e readback que force cada uma das duas saídas do CFG. Escritas de EXEC atualmente exigem frame e a restauração permanece vinculada ao par salvo.
+
+
+A variante numérica 84 passou nos 2048 pixels em D3D12, WARP e Vulkan, com zero erros das camadas. Testes GPU incluíram CLASS_F64 com os dez padrões IEEE e as máscaras complementares e F16 com zero de sinal oposto, subnormal positivo e NaN. CMPX_CLASS_F64 foi coberto separadamente no validador SPIR-V. Build UWP/D3D12 e regressão shader_cfg passaram. Sem execução Xbox. Evidências em build/ps4-gcn-fp-classes.
+
+Meta ativa. Próxima ação: compartilhar o mapa de predicados entre VOPC e VOP3, com destinos explícitos em par SGPR e controle de modificadores. Comparações sinalizantes, escritas de EXEC fora do padrão de frame e readback de cada saída divergente permanecem pendentes.
+
+
+CMP/CMPX VOP3 foi validado com readback da variante 84 nos 2048 pixels em cada backend D3D12, WARP e Vulkan. O caso CMPX grava s[20:21] e reduz EXEC. O caso CMP verifica o modificador ABS, a preservação de VCC até a cópia e o valor observado após copiar o par. SPIR-V, DXIL, nove testes GNM/PS5 e build UWP/D3D12 passaram. Evidências em build/ps4-gcn-vop3-compare. Sem execução Xbox.
+
+A meta permanece ativa. Próxima ação: mapear variantes sinalizantes de F32/F64 e avaliar os efeitos observáveis de exceção GCN, além de completar seletores e fontes dos formatos restantes. Escritas gerais de EXEC fora do frame salvo e readback que force as duas saídas do CFG continuam pendentes.
+
+
+## 2026-11-09 — Readback das duas saídas do CFG divergente
+
+Ps4GcnShaderTests gera dois módulos. Ambos executam uma escrita VALU sob EXEC reduzido. Depois, S_AND_B64 prepara EXECZ ou EXECNZ a partir do par salvo e de uma máscara conhecida. Isso força uma saída por cena independentemente do tamanho de wave do host. Cada saída restaura EXEC, escreve um valor azul distinto e exporta. O vermelho distingue as lanes que executaram a escrita das lanes que preservaram o VGPR. O caso negativo que elimina a segunda restauração continua sendo recusado pelo decoder.
+
+Ps4GcnDxilTests, Ps4RasterTests e run-ps4-gcn-gpu.ps1 incorporam os dois módulos. Readback passou nas duas saídas em D3D12, WARP e Vulkan, com 2048 pixels por caso, total de 12288 pixels novos e zero erros de validação. SPIR-V e DXIL passaram. CTest das nove regressões GNM/PS5 passou em 4,91 s. Os fontes do runtime e do UWP são os mesmos da última rodada com build aprovado. Logs em build/ps4-gcn-multi-exit. Sem execução Xbox.
+
+Meta ativa. Próxima ação: permitir o padrão de salvar EXEC com MOV em um par SGPR, rastrear a proveniência nas junções e validar restauração após escritas diretas. Comparações sinalizantes e seletores e operandos restantes também continuam pendentes.
+
+
+## 2026-11-09 — EXEC salvo por MOV e escritas diretas
+
+GcnDecoder.cpp rastreia pares SGPR com uma cópia de EXEC de entrada, inclusive cópias B64 entre pares. Uma escrita em qualquer palavra invalida a proveniência. Nas junções, somente pares comprovados em todos os caminhos sobrevivem. A presença de uma cópia permite alterar EXEC por B64 ou por metades sem AND_SAVEEXEC. Antes de exportar, todo caminho com EXEC alterado precisa restaurá-lo de um par comprovado. O controle de frames existente continua válido para regiões aninhadas.
+
+As duas fixtures de CFG usam MOV para salvar EXEC, AND para selecionar lanes e MOV para copiar o par antes da restauração em cada saída. Uma cena também limpa EXEC_LO/HI separadamente. O caso de clobber de uma palavra antes da cópia é recusado. A primeira execução CTest compilou a fixture antes do ajuste na posição do clobber e falhou na checagem do diagnóstico. A recompilação focada e o CTest final passaram 10/10 em 9,01 s, incluindo shader_cfg. Build UWP/D3D12 passou. Readback passou nas duas saídas em D3D12, WARP e Vulkan, 12288 pixels no total e zero erros de validação. Logs em build/ps4-gcn-direct-exec. Sem execução Xbox.
+
+Meta ativa. Ainda falta aceitar restaurações comprovadas com metades salvas e restauradas separadamente, assim como escritas cuja restauração não passe por um par SGPR de entrada. Próximo incremento: rastrear a proveniência separada de EXEC_LO/HI e validar os joins que perdem somente uma metade. Comparações sinalizantes e seletores e operandos restantes continuam pendentes.
+
+
+## 2026-11-09 — Restauração independente de EXEC_LO e EXEC_HI
+
+GcnDecoder.cpp acompanha a proveniência de cada metade por SGPR. MOV_B32 salva, copia e restaura uma metade, MOV_B64 transfere a proveniência de ambas. Escritas parciais em SGPR invalidam a palavra atingida. Junções intersectam a proveniência e conservam qualquer metade que ainda precise ser restaurada. A largura da máscara de saída de CMP é 64 bits mesmo com operandos de 32 bits.
+
+A fixture de duas saídas cobre o par B64 e a restauração por dois MOV_B32, com um caso negativo em que só um caminho sobrescreve a metade alta. CTest final 10/10 em 5,94 s, incluindo shader_cfg. Build UWP/D3D12 aprovado. Readback D3D12, WARP e Vulkan passou com 12288 pixels nas duas saídas e zero erros das camadas. Após a correção da largura de escrita CMP, os 48 módulos regenerados coincidiram por SHA-256 com os usados no readback. A primeira execução manual para conferir hashes falhou por falta do PATH MSYS2 e foi repetida com o ambiente correto. Logs em build/ps4-gcn-exec-halves. Sem execução Xbox.
+
+Meta ativa. Próxima ação: ampliar os formatos de operandos de comparação e tratar CMP sinalizante com semântica observável de exceção. Restauração por expressões equivalentes e exports com EXEC modificado ainda exigem modelagem adicional.
+
+
+A rodada final incluiu VOP3 U64 com fontes EXEC e VCC, além de literais VOPC F64/I64/U64 e CLASS_F64, e inline F64/I64. A variante 84 passou em D3D12, WARP e Vulkan, 2048 pixels por backend. Validadores SPIR-V/DXIL e camadas GPU passaram. CTest final 10/10 inclui a fixture atual e shader_cfg PS5. Build UWP/D3D12 aprovado. Sem execução Xbox. Evidências em build/ps4-gcn-wide-operands.
+
+Meta ativa. Próxima ação: tratar fontes especiais de comparação (SCC, EXECZ e VCCZ) com definição e voto corretos e ampliar formatos SDWA/DPP conforme a geração. Comparações sinalizantes e exports com EXEC alterado ainda exigem modelagem.
+
+
+## 2026-11-09 — Fontes de condição em CMP/CMPX
+
+GcnDecoder.cpp aceita SCC, EXECZ e VCCZ em VOPC e VOP3. VOP3 aplica a restrição da fonte escalar compartilhada. SCC precisa estar definido e VCCZ exige as duas metades de VCC. A tradução reutiliza a leitura escalar existente, incluindo extensão com zeros para fontes de 64 bits. A fixture cobre SCC 0/1, VCCZ 0/1 e EXECZ com EXEC restaurado, e casos negativos de SCC e VCCZ indefinidos.
+
+CTest passou 10/10 em 6,61 s, incluindo shader_cfg do PS5. O build UWP/D3D12 passou. A variante 84 passou nos 2048 pixels em D3D12, WARP e Vulkan, com validadores SPIR-V/DXIL aprovados. Logs em build/ps4-gcn-condition-operands. Sem execução Xbox.
+
+Meta ativa. Próxima ação: validar as regras SDWA do perfil GCN, incluindo seleção e extensão de subpalavras e distinções de DPP entre gerações. Comparações sinalizantes e exports com EXEC alterado continuam pendentes.

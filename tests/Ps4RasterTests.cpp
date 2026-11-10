@@ -261,6 +261,30 @@ static void IntegerCmpxRasterTests(Run run, const std::filesystem::path& folder,
 }
 
 template <typename Run>
+static void DivergentExitRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
+	for (int variant = 89; variant <= 90; ++variant) {
+		Ps4::RasterState state;
+		std::vector<uint8_t> pixels;
+		std::string error;
+		Require(run(variant, state, pixels, error), error);
+		Require(pixels.size() == 64 * 32 * 4, "divergent exit raster output size");
+		for (uint32_t y = 0; y < 32; ++y)
+			for (uint32_t x = 0; x < 64; ++x) {
+				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				const float shade[] {u < .5f ? .75f : u, v, variant == 89 ? .375f : .625f, 1.f};
+				for (uint32_t c = 0; c < 4; ++c) {
+					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
+					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
+					        "divergent exit selection, EXEC restoration or inactive-lane preservation");
+				}
+			}
+		Save(folder / (std::string(backend) + "-cfg-exit-" + std::to_string(variant - 89) + ".ppm"), state, pixels);
+		std::printf("PS4_RASTER %s divergent CFG exit=%d all=2048 PASS\n", backend, variant - 89);
+	}
+}
+
+template <typename Run>
 static void RasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
 	for (int variant = 0; variant < 59; ++variant) {
 		Ps4::RasterState state;
@@ -475,6 +499,7 @@ static void RasterTests(Run run, const std::filesystem::path& folder, const char
 	MaskRasterTests(run, folder, backend);
 	ElseRasterTests(run, folder, backend);
 	IntegerCmpxRasterTests(run, folder, backend);
+	DivergentExitRasterTests(run, folder, backend);
 	Ps4::RasterState state;
 	state.alpha_blend = true;
 	const Ps4::LinearTarget target {0x8000, state.width, state.height, state.width * 4};
@@ -587,7 +612,9 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.dxil"
 				                                                   : "gcn-small.vert.dxil"));
 				    const auto ps = Read<uint8_t>(
-				        folder / (variant == 82                    ? "gcn-icmp0.frag.dxil"
+				        folder / (variant == 89                    ? "gcn-cfg-exit0.frag.dxil"
+				                  : variant == 90                    ? "gcn-cfg-exit1.frag.dxil"
+				                  : variant == 82                    ? "gcn-icmp0.frag.dxil"
 				                  : variant == 83                    ? "gcn-icmp1.frag.dxil"
 				                  : variant == 84                    ? "gcn-icmp2.frag.dxil"
 				                  : variant == 85                    ? "gcn-icmp3.frag.dxil"
@@ -735,7 +762,9 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.spv"
 				                                                   : "gcn-small.vert.spv"));
 				    const auto ps = Read<uint32_t>(
-				        folder / (variant == 82                    ? "gcn-icmp0.frag.spv"
+				        folder / (variant == 89                    ? "gcn-cfg-exit0.frag.spv"
+				                  : variant == 90                    ? "gcn-cfg-exit1.frag.spv"
+				                  : variant == 82                    ? "gcn-icmp0.frag.spv"
 				                  : variant == 83                    ? "gcn-icmp1.frag.spv"
 				                  : variant == 84                    ? "gcn-icmp2.frag.spv"
 				                  : variant == 85                    ? "gcn-icmp3.frag.spv"

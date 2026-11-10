@@ -304,6 +304,17 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 	code = specialized;
 	Decoder::Program decoded;
 	if (!Decode(code, stage, decoded, error, parameter_count)) return false;
+	if (frozen.prefix_instructions) {
+		const auto& last = decoded.instructions[frozen.prefix_instructions - 1];
+		const uint32_t body_pc = last.pc + last.word_count * 4;
+		for (const auto& inst : decoded.instructions) {
+			if ((inst.opcode == Decoder::Opcode::S_BRANCH || Decoder::IsConditionalBranch(inst.opcode)) &&
+			    inst.branch_target < body_pc) {
+				error = "branch reenters the immutable S_LOAD prelude";
+				return false;
+			}
+		}
+	}
 	std::map<uint32_t, BufferDescriptor> by_pc;
 	std::bitset<104>                     descriptor_mask;
 	ImageDescriptor                      image_descriptor;
@@ -368,7 +379,7 @@ bool Compile(std::span<const uint32_t> code, Stage stage, std::vector<uint32_t>&
 		for (size_t i = frozen.prefix_instructions; i < decoded.instructions.size(); ++i) {
 			const auto& inst = decoded.instructions[i];
 			if (inst.dst.kind != Decoder::OperandKind::Sgpr) continue;
-			const uint32_t count = (inst.family == Decoder::Family::SMEM || inst.opcode == Decoder::Opcode::S_AND_SAVEEXEC_B64) ? inst.data_dwords : 1;
+			const uint32_t count = inst.family == Decoder::Family::VOPC ? 2 : inst.data_dwords;
 			for (uint32_t n = 0; n < count; ++n)
 				if (descriptor_mask.test(inst.dst.reg + n)) {
 					error = "buffer descriptor SGPR mutation unsupported";
