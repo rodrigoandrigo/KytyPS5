@@ -426,6 +426,21 @@ void Translator::S_BFE_U64(const Decoder::Instruction& inst) {
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {field, IR::Value(0u), IR::Value(6u)}));
 	const auto count =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {field, IR::Value(16u), IR::Value(7u)}));
+	if (inst.data_signed) {
+		const IR::U32 zero(IR::Value(0u)), bits(IR::Value(64u));
+		const auto available = ir.ISub(bits, offset);
+		const auto width = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {count, available}));
+		const auto aligned = ir.Emit(IR::ValueOpcode::ShiftLeftLogical64,
+		                             {source, ir.ISub(available, width)});
+		const auto extended = IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64,
+		                                    {aligned, ir.ISub(bits, width)}));
+		const auto words = ExtractU64(extended);
+		const auto empty = ir.IEqual(width, zero);
+		const std::array result {ir.Select(empty, zero, words[0]), ir.Select(empty, zero, words[1])};
+		WriteU32Pair(inst.dst, result);
+		ir.SetScc(ir.INotEqual(ir.BitwiseOr(result[0], result[1]), zero));
+		return;
+	}
 	// The shift already clears bits past the source; widths of 64 and more keep every bit.
 	const auto low_count = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {count, IR::Value(32u)}));
 	const auto high_count =

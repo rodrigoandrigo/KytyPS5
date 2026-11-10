@@ -263,7 +263,7 @@ static void IntegerCmpxRasterTests(Run run, const std::filesystem::path& folder,
 
 template <typename Run>
 static void DivergentExitRasterTests(Run run, const std::filesystem::path& folder, const char* backend) {
-	for (int variant = 89; variant <= 92; ++variant) {
+	for (int variant : {89, 90, 91, 92, 123, 124}) {
 		Ps4::RasterState state;
 		std::vector<uint8_t> pixels;
 		std::string error;
@@ -272,9 +272,11 @@ static void DivergentExitRasterTests(Run run, const std::filesystem::path& folde
 		for (uint32_t y = 0; y < 32; ++y)
 			for (uint32_t x = 0; x < 64; ++x) {
 				const float u = (float(x) + .5f - 8) / 48, v = (float(y) + .5f - 4) / 24;
-				const bool inside = u >= 0 && v >= 0 && u + v < 1;
+				const bool inside = u >= 0 && v >= 0 && u + v < 1 &&
+				    (variant < 123 || (variant == 123 ? u < .5f && v < .5f
+				                                      : u >= .5f && v < .375f));
 				const float red = u < .5f ? .75f : (variant == 91 ? .875f : u);
-				const float shade[] {red, v, variant % 2 ? .375f : .625f, 1.f};
+				const float shade[] {red, v, variant >= 123 || variant % 2 ? .375f : .625f, 1.f};
 				for (uint32_t c = 0; c < 4; ++c) {
 					const float expected = inside ? shade[c] * 255 : (c == 3 ? 255.f : 0.f);
 					Require(std::abs(int(pixels[(y * 64 + x) * 4 + c]) - int(std::lround(expected))) <= 1,
@@ -747,7 +749,8 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint8_t>(
-				        folder / (variant == 118                   ? "gcn-eight.vert.dxil"
+				        folder / (variant >= 123                   ? "gcn-interp.vert.dxil"
+					                  : variant == 118                   ? "gcn-eight.vert.dxil"
 				                  : variant == 107                   ? "gcn-two-images.vert.dxil"
 				                  : variant == 98                    ? "gcn-three.vert.dxil"
 				                  : variant >= 93                    ? "gcn-small.vert.dxil"
@@ -768,7 +771,9 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.dxil"
 				                                                   : "gcn-small.vert.dxil"));
 				    const auto ps = Read<uint8_t>(
-				        folder / (variant == 122                   ? "gcn-srt-store.frag.dxil"
+				        folder / (variant == 123                   ? "gcn-cfg-mrt0.frag.dxil"
+					                  : variant == 124                   ? "gcn-cfg-mrt1.frag.dxil"
+					                  : variant == 122                   ? "gcn-srt-store.frag.dxil"
 				                  : variant == 121                   ? "gcn-raster-storage.frag.dxil"
 				                  : variant >= 119                   ? "gcn-mubuf-table.frag.dxil"
 				                  : variant == 118                   ? "gcn-eight.frag.dxil"
@@ -919,7 +924,8 @@ int main(int argc, char** argv) {
 			RasterTests(
 			    [&](int variant, const auto& state, auto& image, auto& error) {
 				    const auto vs = Read<uint32_t>(
-				        folder / (variant == 118                   ? "gcn-eight.vert.spv"
+				        folder / (variant >= 123                   ? "gcn-interp.vert.spv"
+					                  : variant == 118                   ? "gcn-eight.vert.spv"
 				                  : variant == 107                   ? "gcn-two-images.vert.spv"
 				                  : variant == 98                    ? "gcn-three.vert.spv"
 				                  : variant >= 93                    ? "gcn-small.vert.spv"
@@ -940,7 +946,9 @@ int main(int argc, char** argv) {
 				                  : variant == 1                   ? "gcn.vert.spv"
 				                                                   : "gcn-small.vert.spv"));
 				    const auto ps = Read<uint32_t>(
-				        folder / (variant == 122                   ? "gcn-srt-store.frag.spv"
+				        folder / (variant == 123                   ? "gcn-cfg-mrt0.frag.spv"
+					                  : variant == 124                   ? "gcn-cfg-mrt1.frag.spv"
+					                  : variant == 122                   ? "gcn-srt-store.frag.spv"
 				                  : variant == 121                   ? "gcn-raster-storage.frag.spv"
 				                  : variant >= 119                   ? "gcn-mubuf-table.frag.spv"
 				                  : variant == 118                   ? "gcn-eight.frag.spv"

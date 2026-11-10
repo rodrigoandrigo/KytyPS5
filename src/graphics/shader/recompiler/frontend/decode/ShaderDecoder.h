@@ -13,6 +13,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
 constexpr uint32_t SharedApertureHigh = 0x80000000u;
+constexpr uint32_t ProvenIndirectTargets = UINT32_MAX - 1;
 
 enum class Family {
 	Unknown,
@@ -880,6 +881,11 @@ struct Instruction {
 		uint32_t gcn_buffer_candidates[4][3]; // Fourth word is the fixed raw/identity format.
 		// GCN linear RGBA8 candidates store the three variable descriptor words.
 		uint32_t gcn_image_candidates[4][3];
+		// Proven shader-relative S_SETPC targets in the normalized GCN frontend.
+		struct {
+			uint32_t count;
+			uint32_t pcs[11];
+		} gcn_indirect;
 	};
 	uint32_t       memory_segment                               = 0;
 	bool           data_signed                                  = false;

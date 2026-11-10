@@ -121,12 +121,12 @@ bool RegisterLimits(std::span<const uint32_t> code, std::span<const uint32_t> us
 		}
 		const ShaderRecompiler::Decoder::Operand operands[] {inst.dst, inst.src0, inst.src1,
 		                                                     inst.src2, inst.src3};
-		for (const auto& op: operands) {
+		for (size_t index = 0; index < std::size(operands); ++index) {
+			const auto& op = operands[index];
 			const bool paired =
-			    (inst.data_dwords == 2 &&
-			     (inst.family == ShaderRecompiler::Decoder::Family::SOP2 ||
-			      inst.family == ShaderRecompiler::Decoder::Family::SOP1 ||
-			      inst.family == ShaderRecompiler::Decoder::Family::VOPC)) ||
+			    (index == 0 && inst.data_dwords == 2) ||
+			    (index != 0 && ShaderRecompiler::Gcn::ScalarSourceIsPair(inst, uint32_t(index - 1))) ||
+			    (inst.data_dwords == 2 && inst.family == ShaderRecompiler::Decoder::Family::VOPC) ||
 			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&
 			     (op.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && &op == &operands[0])) ||
 			    (inst.family == ShaderRecompiler::Decoder::Family::VOPC &&

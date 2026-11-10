@@ -734,7 +734,7 @@ void Translator::WriteVectorMask(const Decoder::Operand& operand, IR::U1 value) 
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::Block& info) {
+                                    IR::Block& info, bool scalar_mask_branches) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		// A zero kind negates the vote of the nonzero kind that follows it in the enum.
 		const bool zero = kind == CFG::BranchCondition::SccZero ||
@@ -745,8 +745,19 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		switch (kind) {
 			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+			case CFG::BranchCondition::VccNonZero:
+			case CFG::BranchCondition::ExecNonZero:
+				if (scalar_mask_branches) {
+					const bool vcc = kind == CFG::BranchCondition::VccNonZero;
+					// GCN tests the scalar words even when the host has no invocation
+					// corresponding to a bit set explicitly by SALU.
+					const auto mask = ir.BitwiseOr(vcc ? ir.GetVccLo() : ir.GetExecLo(),
+					                               vcc ? ir.GetVccHi() : ir.GetExecHi());
+					condition = ir.INotEqual(mask, IR::U32(IR::Value(0u)));
+				} else {
+					condition = kind == CFG::BranchCondition::VccNonZero ? ir.GetVcc() : ir.GetExec();
+				}
+				break;
 			case CFG::BranchCondition::ScalarInstruction:
 				EXIT_IF(instruction_branch_condition.IsEmpty());
 				condition = instruction_branch_condition;
@@ -774,12 +785,14 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	}
 	const auto& term = source.terminator;
 	if (term.kind == CFG::TerminatorKind::IndirectBranch) {
-		if (term.indirect_selector_code != UINT32_MAX) {
-			info.indirect_target = ReadScalarCode(term.indirect_selector_code);
-		} else if (term.indirect_pc_sgpr != UINT32_MAX) {
-			info.indirect_target = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
-		} else {
-			EXIT("block %u has no indirect branch selector", source.id);
+		if (info.indirect_target.IsEmpty()) {
+			if (term.indirect_selector_code != UINT32_MAX) {
+				info.indirect_target = ReadScalarCode(term.indirect_selector_code);
+			} else if (term.indirect_pc_sgpr != UINT32_MAX) {
+				info.indirect_target = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
+			} else {
+				EXIT("block %u has no indirect branch selector", source.id);
+			}
 		}
 		ir.Emit(IR::ValueOpcode::ReferenceU32, {info.indirect_target});
 		return;
@@ -1466,9 +1479,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
+			if (instruction.opcode == Decoder::Opcode::S_SWAPPC_B64 &&
+			    instruction.branch_target == Decoder::ProvenIndirectTargets) {
+				// The return address write can overwrite the source pair.
+				IR::IREmitter before_swap(block);
+				block->indirect_target = before_swap.GetScalarReg(
+				    static_cast<IR::ScalarReg>(cfg_block.terminator.indirect_pc_sgpr));
+			}
 			translator.TranslateInstruction(instruction);
 		}
-		translator.AddBranchCondition(cfg, cfg_block, *block);
+		translator.AddBranchCondition(cfg, cfg_block, *block, options.gcn_vertex_inputs);
 	}
 	return result;
 }

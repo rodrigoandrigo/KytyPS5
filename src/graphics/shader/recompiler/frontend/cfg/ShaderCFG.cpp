@@ -526,6 +526,14 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
                          SetpcTargetInfo& info) {
+	const auto& inst = program.instructions[setpc_index];
+	if (inst.branch_target == Decoder::ProvenIndirectTargets) {
+		info.indirect = true;
+		info.pc_sgpr = inst.src0.reg;
+		info.target_pcs.assign(inst.gcn_indirect.pcs,
+		                       inst.gcn_indirect.pcs + inst.gcn_indirect.count);
+		return true;
+	}
 	if (ResolveSetpcDwordJumpTable(program, setpc_index, info)) {
 		return true;
 	}
@@ -1439,7 +1447,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
 		if (Decoder::IsDirectBranch(inst.opcode) ||
-		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
+		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX &&
+		     inst.branch_target != Decoder::ProvenIndirectTargets)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
@@ -1449,12 +1458,13 @@ Graph BuildGraph(const Decoder::Program& program) {
 			if (next_pc <= end_pc) {
 				labels.push_back(next_pc);
 			}
-		} else if (inst.opcode == Opcode::S_SETPC_B64) {
+		} else if (inst.opcode == Opcode::S_SETPC_B64 ||
+		           inst.branch_target == Decoder::ProvenIndirectTargets) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
 				ExitBuildFailure(
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
+				    fmt::format("unsupported dynamic PC branch at pc 0x{:08x}", inst.pc));
 			}
 			const auto target_pcs = target_info.indirect
 			                            ? std::span<const uint32_t>(target_info.target_pcs)
@@ -1463,7 +1473,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				if (!IsValidTarget(target, program.instructions, end_pc)) {
 					ExitBuildFailure(
 					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
+					    fmt::format("indirect PC branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
 					                inst.pc, target));
 				}
 				labels.push_back(target);
@@ -1520,10 +1530,12 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
-		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX) {
+		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX &&
+		           last.branch_target != Decoder::ProvenIndirectTargets) {
 			block.terminator.kind = TerminatorKind::Branch;
 			block.terminator.true_block = block_at_pc(last.branch_target);
-		} else if (last.opcode == Opcode::S_SETPC_B64) {
+		} else if (last.opcode == Opcode::S_SETPC_B64 ||
+		           last.branch_target == Decoder::ProvenIndirectTargets) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
 				block.terminator.kind                   = TerminatorKind::IndirectBranch;
@@ -1647,7 +1659,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 			    return block.terminator.kind == TerminatorKind::IndirectBranch;
 		    });
 		graph.failure_block = indirect != graph.blocks.end() ? indirect->id : graph.entry_block;
-		graph.unsupported_reason = "indirect S_SETPC_B64 jump table requires dispatcher fallback";
+		graph.unsupported_reason = "indirect PC branch requires dispatcher fallback";
 	}
 
 	if (graph.irreducible) {

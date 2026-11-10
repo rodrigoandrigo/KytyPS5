@@ -64,8 +64,9 @@ int wmain(int argc, wchar_t** argv) {
 	Check(SUCCEEDED(create(CLSID_DxcValidator, IID_PPV_ARGS(&validator))), "create validator");
 	Check(spirv_to_dxil_get_runtime_conf_size() == sizeof(dxil_spirv_runtime_conf),
 	      "Mesa config ABI");
-	for (int variant = 0; variant < 59; ++variant) {
-		const auto              vs_name = variant == 56   ? "gcn-eight.vert"
+	for (int variant = 0; variant < 61; ++variant) {
+		const auto              vs_name = variant >= 59   ? "gcn-interp.vert"
+		                                  : variant == 56   ? "gcn-eight.vert"
 		                                  : variant == 53   ? "gcn-two-images.vert"
 		                                  : variant == 48   ? "gcn-three.vert"
 		                                  : variant >= 44   ? "gcn-small.vert"
@@ -112,6 +113,8 @@ int wmain(int argc, wchar_t** argv) {
 		                                  : variant == 56 ? "gcn-eight.frag"
 		                                  : variant == 57 ? "gcn-raster-storage.frag"
 		                                  : variant == 58 ? "gcn-srt-store.frag"
+		                                  : variant == 59 ? "gcn-cfg-mrt0.frag"
+		                                  : variant == 60 ? "gcn-cfg-mrt1.frag"
 		                                  : variant == 28   ? "gcn-else0.frag"
 		                                  : variant == 29 ? "gcn-else1.frag"
 		                                  : variant == 30 ? "gcn-else2.frag"

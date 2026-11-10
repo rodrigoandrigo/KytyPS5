@@ -40,7 +40,7 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-	                        IR::Block& info);
+	                        IR::Block& info, bool scalar_mask_branches);
 
 private:
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);

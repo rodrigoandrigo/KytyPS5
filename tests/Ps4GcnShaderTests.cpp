@@ -634,10 +634,12 @@ int main(int argc, char** argv) {
 		};
 		auto bad = Gcn::MaskedPixelFixture();
 		for (auto& word: bad) if (word == 0xbefe0410u) word = 0xbf800000u;
-		reject_mask(bad); // export under reduced EXEC
+		std::vector<uint32_t> masked_export;
+		Check(Gcn::Compile(bad, Gcn::Stage::Pixel, masked_export, error, {}, 1), error);
+		Check(validator.Validate(masked_export), "export under reduced EXEC SPIR-V");
 		bad = Gcn::MaskedPixelFixture();
 		for (auto& word: bad) if (word == 0xbefe0410u) word = 0xbefe0412u;
-		reject_mask(bad); // wrong saved pair
+		reject_mask(bad); // undefined source pair
 		bad = Gcn::MaskedPixelFixture();
 		for (auto& word: bad) if (word == 0xbe90246au) word = 0xbe90246bu;
 		reject_mask(bad); // VCC_HI is not a complete wave64 source
@@ -646,12 +648,14 @@ int main(int argc, char** argv) {
 			bad.insert(bad.begin() + i + 1, 0xbe910380u); // overwrite high word of active saved pair
 			break;
 		}
-		reject_mask(bad);
+		Check(Gcn::Compile(bad, Gcn::Stage::Pixel, masked_export, error, {}, 1), error);
+		Check(validator.Validate(masked_export), "clobbered snapshot remains a legal PS mask");
 		bad = Gcn::MaskedPixelFixture();
 		for (size_t i = 0; i < bad.size(); ++i) if (bad[i] == 0xbe90246au) {
-			bad.insert(bad.begin() + i + 1, 0x7e280280u); // undefined v20 under EXEC
+			bad.insert(bad.begin() + i + 1, 0x7e280280u); // v20 is defined only under reduced EXEC.
 			break;
 		}
+		bad[bad.size() - 2] = 0x05040314u; // Restored EXEC may now read an undefined v20.
 		reject_mask(bad);
 		bad = Gcn::MaskedPixelFixture();
 		for (size_t i = 0; i < bad.size(); ++i) if (bad[i] == 0xbe90246au) {
@@ -664,7 +668,7 @@ int main(int argc, char** argv) {
 			bad.insert(bad.begin() + i, {0xbf068080u, 0xbf850001u}); // branch skips only SAVEEXEC
 			break;
 		}
-		reject_mask(bad); // inconsistent stack at CFG join
+		reject_mask(bad); // restore reads undefined SGPRs on the path that skips SAVEEXEC
 		bad = Gcn::MaskedPixelFixture();
 		for (size_t i = 0; i < bad.size(); ++i) if (bad[i] == 0xbe90246au) {
 			bad.erase(bad.begin() + i);
@@ -672,7 +676,8 @@ int main(int argc, char** argv) {
 				bad.insert(bad.begin() + i + n, 0xbe80246au | ((16u + 2 * n) << 16));
 			break;
 		}
-		reject_mask(bad); // nesting budget before any export
+		Check(Gcn::Compile(bad, Gcn::Stage::Pixel, masked_export, error, {}, 1), error);
+		Check(validator.Validate(masked_export), "nine consecutive SAVEEXEC operations");
 		bad = Gcn::MaskedPixelFixture(false, true);
 		bad.erase(bad.begin() + 9); // remove defining VOPC; V_CNDMASK cannot read undefined VCC
 		reject_mask(bad);
@@ -837,12 +842,11 @@ int main(int argc, char** argv) {
 			          error.find(source == 251 ? "VCCZ requires" : "undefined SCC") != std::string::npos,
 			      "undefined compare condition source");
 		}
-		// CMPX outside a saved frame would leave no proven restoration path.
-		auto bad = Gcn::IntegerComparePixelFixture();
-		for (auto& word: bad) if ((word & 0xfe000000u) == 0x7c000000u) word |= 16u << 17;
-		std::vector<uint32_t> kept {123};
-		Check(!Gcn::Compile(bad, Gcn::Stage::Pixel, kept, error, {}, 1) &&
-		          kept == std::vector<uint32_t> {123}, "CMPX without saved frame accepted");
+		auto masked = Gcn::IntegerComparePixelFixture();
+		for (auto& word: masked) if ((word & 0xfe000000u) == 0x7c000000u) word |= 16u << 17;
+		std::vector<uint32_t> masked_words;
+		Check(Gcn::Compile(masked, Gcn::Stage::Pixel, masked_words, error, {}, 1), error);
+		Check(validator.Validate(masked_words), "CMPX without saved frame");
 		// Explicitly inspect decoded semantics: the shared RDNA path must not
 		// acquire the GCN two-mask rule by opcode-name coincidence.
 		ShaderRecompiler::Decoder::Program program;
@@ -887,6 +891,58 @@ int main(int argc, char** argv) {
 		          error.find("undefined upper SGPR") != std::string::npos, "undefined B64 input");
 	}
 	{
+		// Select and conditionally replace VCC, then edit and reverse its two words.
+		const std::vector<uint32_t> mask_ops {
+		    0xbeea04c1u, // S_MOV_B64 VCC, -1
+		    0xbf008080u, // S_CMP_EQ_I32 0, 0
+		    0xbeea0680u, // S_CMOV_B64 VCC, 0
+		    0xbeea1e7fu, // S_BITSET1_B64 VCC, EXEC_HI
+		    0xbeea1c80u, // S_BITSET0_B64 VCC, 0
+		    0xbeea0c6au, // S_BREV_B64 VCC, VCC
+		    0xbeea086au, // S_NOT_B64 VCC, VCC
+		    0x85ea806au, // S_CSELECT_B64 VCC, VCC, 0
+		};
+		auto code = Gcn::SolidPixelFixture();
+		code.insert(code.begin(), mask_ops.begin(), mask_ops.end());
+		// Consume the final VCC_HI through an ordinary SGPR source.
+		code.insert(code.end() - 3, {0xbe94036bu, 0x7e000214u});
+		std::vector<uint32_t> words;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error), error);
+		Check(validator.Validate(words), "B64 mask operations SPIR-V");
+		code.erase(code.begin());
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined VCC half") != std::string::npos,
+		      "conditional move requires a defined old destination");
+		auto halves = Gcn::SolidPixelFixture();
+		halves.insert(halves.begin(), {0xbeea0381u, 0xbeeb0380u,
+		                              0xbeeb1d9fu, // BITSET1 VCC_HI, 31
+		                              0xbeeb0b6bu, // BREV VCC_HI, VCC_HI
+		                              0xbeeb1b80u, // BITSET0 VCC_HI, 0
+		                              0xbeea096au, // WQM_B32 VCC_LO, VCC_LO
+		                              0xbeeb0581u, // CMOV VCC_HI, 1, using WQM's SCC
+		                              0xbeea0a6au}); // WQM_B64 VCC, VCC
+		halves.insert(halves.end() - 3, {0xbe94036bu, 0x7e000214u});
+		Check(Gcn::Compile(halves, Gcn::Stage::Pixel, words, error), error);
+		Check(validator.Validate(words), "half-mask operations SPIR-V");
+		halves.erase(halves.begin() + 1);
+		Check(!Gcn::Compile(halves, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined VCC half") != std::string::npos, "bitset needs old half");
+		for (uint32_t op : {31u, 33u, 35u, 37u, 41u, 42u}) {
+			auto mixed = Gcn::SolidPixelFixture();
+			// s23 is deliberately undefined. The shift or field control is one word.
+			const uint32_t lhs = op == 37 ? 129u : 16u;
+			mixed.insert(mixed.begin(), {0xbe9004c1u, 0xbe9603bfu,
+			                             0x806a1600u | (op << 23) | lhs});
+			mixed.insert(mixed.end() - 3, {0xbe94036bu, 0x7e000214u});
+			Check(Gcn::Compile(mixed, Gcn::Stage::Pixel, words, error), error);
+			Check(validator.Validate(words), "mixed scalar width B64 SPIR-V");
+			if (op == 37) continue;
+			mixed[0] = 0xbe9003c1u;
+			Check(!Gcn::Compile(mixed, Gcn::Stage::Pixel, words, error) &&
+			          error.find("undefined upper SGPR") != std::string::npos, "wide data needs a pair");
+		}
+	}
+	{
 		auto code = Gcn::SolidPixelFixture();
 		// s0 = 3; do { s0 -= 1; } while (s0 != 0).
 		code.insert(code.begin(), {0xbe800383u, 0x80808100u, 0xbf078000u, 0xbf85fffdu});
@@ -899,6 +955,55 @@ int main(int argc, char** argv) {
 		          error.find("undefined register") != std::string::npos, "loop entry definition");
 	}
 	{
+		auto code = Gcn::SolidPixelFixture();
+		code.insert(code.begin(), {0xbeea0380u, 0xbeeb0381u,
+		                          0xbf0ca06au, // BITCMP0_B32 VCC_LO, 32
+		                          0xbf0da06bu, // BITCMP1_B32 VCC_HI, 32
+		                          0xbf0ea06au, // BITCMP0_B64 VCC, 32
+		                          0xbf0fa06au}); // BITCMP1_B64 VCC, 32
+		std::vector<uint32_t> words;
+		Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error), error);
+		Check(validator.Validate(words), "scalar bit compare mask halves");
+		code.erase(code.begin() + 1);
+		Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error) &&
+		          error.find("undefined VCC half") != std::string::npos, "undefined bit compare operand");
+		for (uint32_t op = 3; op <= 14; ++op) {
+			auto immediate = Gcn::SolidPixelFixture();
+			immediate.insert(immediate.begin(), {0xbe9003c1u, 0xb010ffffu | (op << 23)});
+			ShaderRecompiler::Decoder::Program program;
+			Check(Gcn::Decode(immediate, Gcn::Stage::Pixel, program, error), error);
+			Check(program.instructions[1].src1.value == (op < 9 ? 0xffffffffu : 0xffffu),
+			      "SOPK comparison immediate extension");
+			Check(Gcn::Compile(immediate, Gcn::Stage::Pixel, words, error), error);
+			Check(validator.Validate(words), "scalar immediate compare SPIR-V");
+		}
+		auto dpp = Gcn::IntegerComparePixelFixture();
+		for (auto& word : dpp)
+			if ((word & 0xfe000000u) == 0x7c000000u) word = (word & ~511u) | 250u;
+		Check(!Gcn::Compile(dpp, Gcn::Stage::Pixel, words, error, {}, 1) &&
+		          error.find("DPP is not supported") != std::string::npos, "Gen4 VOPC DPP rejected");
+	}
+	{
+		for (uint32_t opcode = 64; opcode < 128; ++opcode) {
+			for (bool vop3 : {false, true}) {
+				auto code = Gcn::SolidPixelFixture();
+				// v[8:9] contains a NaN in either precision. v[10:11] is zero.
+				std::vector<uint32_t> compare {
+				    0xbe90047eu, 0x7e1002ffu, 0x7fc00001u,
+				    0x7e1202ffu, 0x7ff80000u, 0x7e140280u, 0x7e160280u};
+				if (vop3) {
+					compare.push_back(0xd000016au | (opcode << 17)); // abs(src0)
+					compare.push_back((266u << 9) | 264u);
+				} else {
+					compare.push_back(0x7c000000u | (opcode << 17) | (10u << 9) | 264u);
+				}
+				compare.insert(compare.end(), {0xbefe0410u, 0x00001480u}); // restore, v_cndmask v0
+				code.insert(code.end() - 3, compare.begin(), compare.end());
+				std::vector<uint32_t> words;
+				Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error), error);
+				Check(validator.Validate(words), "signaling FP compare SPIR-V");
+			}
+		}
 		for (uint32_t predicate = 0; predicate < 16; ++predicate) {
 			auto code = Gcn::CmpxPixelFixture(3);
 			for (auto& word : code)
@@ -942,14 +1047,14 @@ int main(int argc, char** argv) {
 			// The preceding VALU write is divergent in both scenes. Select a
 			// known wave-uniform exit afterward so the oracle is independent of
 			// how the host groups pixels into waves.
-			const uint32_t mask = exit ? 128u : 193u; // zero or all ones
-			code.insert(code.end(), {0xbe920300u | mask, 0xbe930300u | mask});
+			// A scalar high bit must count even on a host subgroup of 32 lanes.
+			code.insert(code.end(), {0xbe920380u, 0xbe930381u});
 			if (exit) {
-				code.insert(code.end(), {0xbefe0312u, 0xbeff0313u}); // Clear both EXEC halves.
+				code.insert(code.end(), {0xbefe0312u, 0xbeff0313u});
 			} else {
-				code.push_back(0x87fe1210u); // AND EXEC, s[16:17], s[18:19]
+				code.push_back(0xbefe0412u); // MOV EXEC, s[18:19]
 			}
-			code.insert(code.end(), {0xbe940410u, exit ? 0xbf880007u : 0xbf880006u});
+			code.insert(code.end(), {0xbe940410u, exit ? 0xbf890007u : 0xbf880006u});
 			const auto append_exit = [&](float blue) {
 				if (exit) code.insert(code.end(), {0xbefe0314u, 0xbeff0315u});
 				else code.push_back(0xbefe0414u);
@@ -969,12 +1074,11 @@ int main(int argc, char** argv) {
 			Check(copy != clobbered.end(), "EXEC snapshot copy");
 			// Only one incoming edge clobbers the upper half.
 			clobbered.insert(copy, {0xbf840001u, 0xbe910380u});
-			const bool accepted = Gcn::Compile(clobbered, Gcn::Stage::Pixel, words, error, {}, 1);
-			Check(!accepted && error.find(exit ? "saved entry half" : "proven entry mask") != std::string::npos,
-			      "overwritten EXEC snapshot: " + error);
+			Check(Gcn::Compile(clobbered, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "distinct EXEC provenance at join");
 			code[code.size() - 6] = 0xbf800000u;
-			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
-			          error.find("requires restored EXEC") != std::string::npos, "unrestored second exit");
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "direct EXEC write at second exit");
 		}
 		for (uint32_t exit = 0; exit < 2; ++exit) {
 			auto code = Gcn::MaskedPixelFixture(false, false);
@@ -1008,8 +1112,88 @@ int main(int argc, char** argv) {
 			file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
 			Check(bool(file), "write saved-frame branch fixture");
 			code[code.size() - 6] = 0xbf800000u;
-			Check(!Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1) &&
-			          error.find("requires restored EXEC") != std::string::npos, "unrestored saved-frame exit");
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "unrestored saved-frame exit");
+		}
+		for (uint32_t exit = 0; exit < 2; ++exit) {
+			auto code = Gcn::MaskedPixelFixture(false, false);
+			const auto save = std::find(code.begin(), code.end(), 0xbe90246au);
+			Check(save != code.end(), "masked export fixture save");
+			code.erase(save, code.end());
+			// Convert the threshold mask into NaN on the left and zero on the right.
+			code.insert(code.end(), {0x7e1802ffu, exit ? 0x7f800001u : 0x7fc00001u,
+			                         0x00161880u}); // v_cndmask v11, 0, v12
+			if (exit) {
+				code.insert(code.end(), {0xbe90047eu, 0xd000006au | (88u << 17),
+				                         (266u << 9) | 267u, 0xbefe0410u}); // CMPSX_U_F32, VOP3
+			} else {
+				code.push_back(0x7c000000u | (72u << 17) | (10u << 9) | 267u); // CMPS_U_F32
+			}
+			// Drive the complementary exits with BITCMP1_B64 and CMPK_EQ_U32.
+			code.insert(code.end(), {exit ? 0xbf800000u : 0xbe960380u,
+			                         exit ? 0xb5160001u : 0xbf0fa016u,
+			                         0x7e0802ffu, std::bit_cast<uint32_t>(.375f), 0xbf840009u,
+			                         0xbefe046au, // S_MOV_B64 EXEC, VCC
+			                         0x7e2802ffu, std::bit_cast<uint32_t>(.75f),
+			                         0x7c000000u | (20u << 17) | (10u << 9) | 276u, // CMPX_GT v20, v10
+			                         0x7c000000u | (17u << 17) | (10u << 9) | 259u, // green < .5
+			                         0x87fe6a7eu, // S_AND_B64 EXEC, EXEC, VCC
+			                         0xf800180fu, 0x05040314u, 0xbf810000u,
+			                         0x8afe6a7eu, // S_ANDN2_B64 EXEC, EXEC, VCC
+			                         0x7e2a0302u, // v21 = v2 under the right mask
+			                         0x7c000000u | (22u << 17) | (10u << 9) | 277u, // CMPX_GE v21, v10
+			                         0x7c000000u | (17u << 17) | (4u << 9) | 259u, // green < .375
+			                         0xf800180fu, 0x05040315u, 0xbf810000u});
+			// Two callsites share a leaf. Only the first continuation writes
+			// s23=1 after the leaf initializes it to zero.
+			const uint32_t leaf_delta = uint32_t((code.size() + 11) * 4);
+			code.insert(code.begin(), {0xbe901f00u, 0x8010ff10u, leaf_delta,
+			                          0x82118011u, 0xbf008080u | exit,
+			                          0xbeea0380u, 0xbeeb0381u,
+			                          exit ? 0xbf870003u : 0xbf860003u,
+			                          0xbe922110u, 0xbe970581u, 0xbf820001u, 0xbe922110u});
+			// The second fixture uses the same pair for the target and saved PC.
+			if (exit)
+				// Set bit 63, extract it with sign extension, then shift -1 down to 1.
+				code.insert(code.end(), {0x9296bf81u, 0x9516ff16u, 0x0001003fu, 0x9096bf16u});
+			else
+				code.insert(code.end(), {0xbe970380u, 0xbe971d80u, 0xbe970b17u, 0xbe971b9fu});
+			code.push_back(exit ? 0xbe922112u : 0xbe802012u);
+			ShaderRecompiler::Decoder::Program decoded;
+			Check(Gcn::Decode(code, Gcn::Stage::Pixel, decoded, error, 1), error);
+			const auto& targets = decoded.instructions.back().gcn_indirect;
+			Check(targets.count == 2 && targets.pcs[0] == 36 && targets.pcs[1] == 48,
+			      "local return has both proven continuations");
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Pixel, words, error, {}, 1), error);
+			Check(validator.Validate(words), "masked MRT export at two exits");
+			std::ofstream file(folder / ("gcn-cfg-mrt" + std::to_string(exit) + ".frag.spv"), std::ios::binary);
+			file.write(reinterpret_cast<const char*>(words.data()), words.size() * 4);
+			Check(bool(file), "write masked MRT fixture");
+			auto bad = code;
+			bad[2] = 4; // PC + 4 lands on the literal payload.
+			Check(!Gcn::Compile(bad, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find("branch into literal") != std::string::npos, "indirect branch into literal");
+			bad = code;
+			bad[3] = 0xbe910380u; // Lose the high address word.
+			Check(!Gcn::Compile(bad, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find("not a proven code address") != std::string::npos, "clobbered indirect PC");
+			bad = code;
+			bad.insert(bad.begin() + 1, 0x7e180210u); // Read the code address into a VGPR.
+			Check(!Gcn::Compile(bad, Gcn::Stage::Pixel, words, error, {}, 1) &&
+			          error.find("PC address cannot be used") != std::string::npos, "PC cannot escape to VGPR");
+		}
+		{
+			auto code = Gcn::TriangleVertexFixture();
+			// Route the saved entry EXEC pair through VCC before restoring it.
+			code.insert(code.begin(), {0xbe902480u, 0xbeea0410u, 0xbefe046au});
+			std::vector<uint32_t> words;
+			Check(Gcn::Compile(code, Gcn::Stage::Vertex, words, error), error);
+			Check(validator.Validate(words), "VS entry mask restored through VCC");
+			code.insert(code.begin() + 2, 0xbeeb0380u); // Clobber VCC_HI.
+			Check(!Gcn::Compile(code, Gcn::Stage::Vertex, words, error) &&
+			          error.find("requires restored EXEC") != std::string::npos,
+			      "VS export requires both entry halves");
 		}
 		for (uint32_t op = 36; op <= 43; ++op) {
 			auto code = Gcn::MaskedPixelFixture(false, false);

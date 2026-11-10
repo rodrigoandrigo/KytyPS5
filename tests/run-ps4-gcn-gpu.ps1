@@ -18,6 +18,7 @@ foreach ($file in @($compiler, $validator, "$VulkanRoot/Include/vulkan/vulkan.h"
                     "$TranslatorRoot/include/spirv_to_dxil.h", "$TranslatorRoot/lib/spirv_to_dxil.lib", "$TranslatorRoot/bin/spirv_to_dxil.dll",
                     "$FixtureRoot/gcn-cfg-exit0.frag.spv", "$FixtureRoot/gcn-cfg-exit1.frag.spv",
                     "$FixtureRoot/gcn-cfg-frame0.frag.spv", "$FixtureRoot/gcn-cfg-frame1.frag.spv",
+                    "$FixtureRoot/gcn-cfg-mrt0.frag.spv", "$FixtureRoot/gcn-cfg-mrt1.frag.spv",
                     "$FixtureRoot/gcn-raw-load.frag.spv",
                     "$FixtureRoot/gcn-raw-sgpr.frag.spv",
                     "$FixtureRoot/gcn-raw-short1.frag.spv", "$FixtureRoot/gcn-raw-short2.frag.spv",

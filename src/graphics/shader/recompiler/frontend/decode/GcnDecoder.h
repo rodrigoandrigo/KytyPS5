@@ -5,6 +5,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Gcn {
 enum class Stage { Vertex, Pixel };
+bool ScalarSourceIsPair(const Decoder::Instruction& inst, uint32_t source);
 // Bounded forward-CFG GCN subset with definite register assignment on all paths
 // and one POS0/MRT0 export per exit. Never calls the RDNA instruction decoder.
 bool                  Decode(std::span<const uint32_t> code, Stage stage, Decoder::Program& output,

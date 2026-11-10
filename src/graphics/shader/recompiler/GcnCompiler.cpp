@@ -335,8 +335,13 @@ static bool CompileImpl(std::span<const uint32_t> code, Stage stage, std::vector
 		const auto& last = decoded.instructions[frozen.prefix_instructions - 1];
 		const uint32_t body_pc = last.pc + last.word_count * 4;
 		for (const auto& inst : decoded.instructions) {
-			if ((inst.opcode == Decoder::Opcode::S_BRANCH || Decoder::IsConditionalBranch(inst.opcode)) &&
-			    inst.branch_target < body_pc) {
+			const bool direct = Decoder::IsDirectBranch(inst.opcode) ||
+			                    inst.opcode == Decoder::Opcode::S_SWAPPC_B64;
+			const bool indirect = inst.branch_target == Decoder::ProvenIndirectTargets;
+			if ((direct && inst.branch_target < body_pc) ||
+			    (indirect && std::any_of(inst.gcn_indirect.pcs,
+			        inst.gcn_indirect.pcs + inst.gcn_indirect.count,
+			        [body_pc](uint32_t target) { return target < body_pc; }))) {
 				error = "branch reenters the immutable S_LOAD prelude";
 				return false;
 			}
@@ -431,8 +436,7 @@ static bool CompileImpl(std::span<const uint32_t> code, Stage stage, std::vector
 		const uint32_t   base = vector_load ? inst.src1.reg : inst.src0.reg;
 		BufferDescriptor descriptor;
 		std::array<uint32_t, 4> words;
-		const bool store = inst.family == Decoder::Family::MUBUF &&
-		    inst.opcode_id >= 28 && inst.opcode_id <= 31;
+		const bool store = inst.opcode == Decoder::Opcode::BUFFER_STORE_DWORD;
 		if (store && (!writable_buffers || !frozen.Words(base, words, error))) {
 			error = "GCN store requires a writable binding and a direct descriptor";
 			return false;
@@ -697,10 +701,7 @@ static bool CompileImpl(std::span<const uint32_t> code, Stage stage, std::vector
 				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x2 &&
 				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x3 &&
 				    it->GetOpcode() != IR::ValueOpcode::LoadBufferU32x4 &&
-				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32 &&
-				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x2 &&
-				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x3 &&
-				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32x4)
+				    it->GetOpcode() != IR::ValueOpcode::StoreBufferU32)
 					continue;
 				const auto& memory =
 				    translated.program.memory_info[it->Flags<IR::MemoryFlags>().index];
